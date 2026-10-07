@@ -1,17 +1,37 @@
-# FalconEYE v2.0 Configuration
+# FalconEYE v2.1 Configuration
 #
 # This is the default configuration file for FalconEYE.
 # You can override settings by creating ~/.falconeye/config.yaml or ./falconeye.yaml
 
 # LLM Provider Settings
 llm:
-  provider: ollama  # LLM provider (ollama, mlx)
+  provider: ollama  # LLM provider (ollama, mlx, litellm)
   model:
     analysis: qwen3-coder:30b  # Model for security analysis
     embedding: embeddinggemma:300m   # Model for generating embeddings
   mlx:
     analysis: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit  # HuggingFace model for MLX inference
-  base_url: http://localhost:11434  # Base URL for LLM API
+
+  # LiteLLM proxy backend (OpenAI-compatible endpoint fronting vLLM,
+  # SGLang, TGI, or any other OpenAI-protocol server). Uncomment and
+  # switch llm.provider to "litellm" above to activate.
+  #
+  # Chat and embeddings can be served from the same host or from
+  # different hosts/ports -- set embedding_base_url only when they
+  # differ. guided_json enforces the finding JSON schema at the
+  # sampler (vLLM >= 0.6, SGLang); disable if your backend does not
+  # support response_format.json_schema (e.g. Ollama's OpenAI-compat).
+  # litellm:
+  #   chat_base_url: http://localhost:8200/v1
+  #   chat_model: gemma-4-31b-it-heretic
+  #   chat_api_key: ""            # LiteLLM virtual key; empty for unauth
+  #   embedding_base_url: ""       # empty falls back to chat_base_url
+  #   embedding_model: embeddinggemma-300m
+  #   embedding_api_key: ""        # empty falls back to chat_api_key
+  #   max_tokens: 32768
+  #   request_timeout: 600.0
+  #   guided_json: true
+  base_url: http://localhost:11434  # Base URL for LLM API (Ollama only; LiteLLM uses llm.litellm.*_base_url)
   timeout: 120  # Request timeout in seconds
   max_retries: 3  # [DEPRECATED] Use retry.max_retries instead
 
@@ -31,15 +51,20 @@ llm:
 
 # Vector Store Settings
 vector_store:
-  provider: chroma  # Vector store provider (chroma, postgres)
+  provider: chroma  # Vector store provider (chroma)
   persist_directory: ./falconeye_data/vectorstore  # Storage directory
   collection_prefix: falconeye  # Prefix for collection names
 
 # Metadata Repository Settings
 metadata:
-  provider: chroma  # Metadata provider (chroma, postgres)
+  provider: chroma  # Metadata provider (chroma)
   persist_directory: ./falconeye_data/metadata  # Storage directory
   collection_name: metadata  # Collection name
+
+# Index Registry Settings (tracks scanned projects for --resume, --list, etc.)
+index_registry:
+  persist_directory: ./falconeye_data/registry  # Storage directory
+  collection_name: index_registry  # Collection name
 
 # Chunking Strategy
 chunking:
@@ -52,10 +77,49 @@ chunking:
   # larger than ~10k lines will exceed that as the chunk size cap takes effect.
 
 # Analysis Settings
+#
+# FalconEYE runs a four-layer defense against LLM hallucination:
+#   1. Reasoning addendum (in every system prompt)          -- content quality
+#   2. Guided JSON (llm.litellm.guided_json)                -- field presence
+#   3. strict_validation (structural, free, this section)   -- grounding
+#   4. two_pass_verification (adversarial LLM, this section) -- FP filtering
+#
+# Each layer catches a distinct failure mode; keep them all unless you
+# have a specific reason to disable one.
 analysis:
   top_k_context: 5  # Number of similar chunks for RAG context
-  validate_findings: true  # Enable AI-based validation (reduces false positives)
-  batch_size: 10  # Files to process in parallel
+  batch_size: 10    # Files to process in parallel
+
+  # Structural validation of every finding: verifies cited line numbers
+  # exist, verifies code_snippet appears in the source, restricts cwe_id
+  # to an enumerated list, flags suspicious CVE references. Failing
+  # findings are downgraded and tagged, never dropped. Free (no LLM cost).
+  strict_validation: true
+
+  # Adversarial second-pass verifier: after primary analysis + enrichment,
+  # every finding gets a fresh LLM call that argues AGAINST the finding.
+  # Verdicts: confirmed / downgrade / false_positive / flag_uncertain.
+  # ~2x LLM cost per file but empirically catches 30-50% of FPs that
+  # survive primary analysis. Opt-in until you have seen how it behaves
+  # on your codebase.
+  two_pass_verification: false
+  verifier:
+    concurrency: 4       # Findings verified in parallel
+    context_lines: 10    # Lines of code above/below the cited lines in the verifier prompt
+    # Optional: point the verifier at a different LLM endpoint for
+    # cross-model verification (litellm provider only). Empty falls
+    # back to the primary chat endpoint.
+    chat_base_url: ""
+    chat_model: ""
+    chat_api_key: ""
+
+  # Legacy AI-based finding validator: extra LLM call per file that
+  # re-scores findings to filter false positives. Superseded by the
+  # strict_validation + two_pass_verification pair above (structural
+  # grounding + per-finding adversarial verification, both with
+  # guided_json enforcement). Kept on for backward compatibility;
+  # safe to set false once you have two_pass_verification running.
+  validate_findings: true
 
 # Language Settings
 languages:
@@ -93,6 +157,21 @@ output:
   verbose: false  # Enable verbose output
   save_to_file: true  # Save output to file (auto-saves JSON + HTML reports)
   output_directory: ./falconeye_reports  # Directory for reports
+
+# SAGE Persistent Memory Integration
+#
+# When enabled, FalconEYE stores review findings and can recall
+# historical context (past findings on similar code, false-positive
+# markings, project-specific notes) before analysis. Requires a
+# running SAGE service. Install with: pip install -e ".[sage]"
+sage:
+  enabled: false                    # Master switch
+  base_url: http://localhost:8090   # SAGE API endpoint
+  identity_path: null               # Path to SAGE agent key file (null = default)
+  timeout: 15.0                     # API request timeout (seconds)
+  store_findings: true              # Store scan findings in SAGE
+  recall_context: true              # Recall historical context before analysis
+  store_throttle_seconds: 0.5       # Delay between memory proposals (0 for multi-node)
 
 # Logging
 logging:
