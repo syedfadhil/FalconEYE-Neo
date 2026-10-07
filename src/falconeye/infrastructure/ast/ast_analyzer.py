@@ -1,0 +1,617 @@
+"""Enhanced AST analyzer with control flow and data flow analysis."""
+
+from pathlib import Path
+from typing import List
+import ast
+import re
+
+try:
+    import tree_sitter_language_pack
+except ModuleNotFoundError:  # pragma: no cover - exercised by fallback tests
+    tree_sitter_language_pack = None
+
+from ...domain.models.structural import (
+    StructuralMetadata,
+    FunctionInfo,
+    ImportInfo,
+    CallInfo,
+    ClassInfo,
+    ControlFlowNode,
+)
+from ..logging import FalconEyeLogger
+
+
+class EnhancedASTAnalyzer:
+    """
+    Enhanced AST analyzer using Tree-sitter.
+
+    Extracts structural metadata including:
+    - Functions, imports, calls, classes
+    - Control flow graphs (CFG)
+    - Data flow information (DFG)
+
+    IMPORTANT: This analyzer extracts metadata for AI context,
+    NOT for pattern-based vulnerability detection.
+    All security analysis is performed by the AI.
+    """
+
+    # Language mapping
+    LANGUAGE_MAP = {
+        '.py': 'python',
+        '.c': 'c',
+        '.h': 'c',
+        '.cpp': 'cpp',
+        '.hpp': 'cpp',
+        '.cc': 'cpp',
+        '.rs': 'rust',
+        '.go': 'go',
+        '.php': 'php',
+        '.java': 'java',
+        '.dart': 'dart',
+        '.js': 'javascript',
+        '.jsx': 'javascript',
+        '.ts': 'typescript',
+        '.tsx': 'typescript',
+        '.cs': 'csharp',
+        '.csx': 'csharp',
+        '.cshtml': 'csharp',
+        '.razor': 'csharp',
+    }
+
+    def __init__(self):
+        """Initialize AST analyzer."""
+        self.logger = FalconEyeLogger.get_instance()
+        self.parsers = {}
+        self._init_parsers()
+
+    def _init_parsers(self):
+        """Initialize Tree-sitter parsers for supported languages."""
+        if tree_sitter_language_pack is None:
+            self.logger.warning(
+                "tree_sitter_language_pack not available; AST analysis will use "
+                "best-effort regex/Python fallback with degraded language coverage"
+            )
+            return
+        for lang in set(self.LANGUAGE_MAP.values()):
+            try:
+                parser = tree_sitter_language_pack.get_parser(lang)
+                self.parsers[lang] = parser
+            except Exception as e:
+                self.logger.warning(
+                    "Could not initialize tree-sitter parser; using fallback when available",
+                    extra={"language": lang, "error": str(e)},
+                )
+
+    def analyze_file(
+        self,
+        file_path: str,
+        content: str,
+    ) -> StructuralMetadata:
+        """
+        Analyze file and extract structural metadata.
+
+        Args:
+            file_path: Path to file
+            content: File content
+
+        Returns:
+            StructuralMetadata with extracted information
+        """
+        # Determine language
+        ext = Path(file_path).suffix.lower()
+        language = self.LANGUAGE_MAP.get(ext)
+
+        if not language:
+            # Return empty metadata for unsupported languages
+            return StructuralMetadata(
+                file_path=file_path,
+                language="unknown"
+            )
+
+        if language not in self.parsers:
+            return self._analyze_with_fallback(file_path, content, language)
+
+        # Parse code
+        parser = self.parsers[language]
+        tree = parser.parse(bytes(content, "utf8"))
+        root = tree.root_node
+
+        # Create metadata
+        metadata = StructuralMetadata(
+            file_path=file_path,
+            language=language
+        )
+
+        # Extract based on language
+        if language == "python":
+            self._analyze_python(root, content, metadata)
+        elif language in ["c", "cpp"]:
+            self._analyze_c_cpp(root, content, metadata)
+        elif language == "rust":
+            self._analyze_rust(root, content, metadata)
+        elif language == "go":
+            self._analyze_go(root, content, metadata)
+        elif language in ["javascript", "typescript"]:
+            self._analyze_javascript(root, content, metadata)
+        elif language == "java":
+            self._analyze_java(root, content, metadata)
+        elif language == "dart":
+            self._analyze_dart(root, content, metadata)
+        elif language == "php":
+            self._analyze_php(root, content, metadata)
+        elif language == "csharp":
+            self._analyze_csharp(root, content, metadata)
+
+        return metadata
+
+    def _analyze_with_fallback(self, file_path: str, content: str, language: str) -> StructuralMetadata:
+        """Best-effort structural extraction when tree-sitter is unavailable.
+
+        Fallback coverage is intentionally partial: Python, JavaScript/TypeScript,
+        and Go get lightweight imports/functions/classes extraction. Other
+        tree-sitter-supported languages return empty metadata rather than failing
+        the scan.
+        """
+        metadata = StructuralMetadata(file_path=file_path, language=language)
+        if language == "python":
+            self._fallback_python(content, metadata)
+        elif language in {"javascript", "typescript"}:
+            self._fallback_javascript(content, metadata)
+        elif language == "go":
+            self._fallback_go(content, metadata)
+        return metadata
+
+    def _fallback_python(self, content: str, metadata: StructuralMetadata):
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError, TypeError):
+            return
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                metadata.functions.append(FunctionInfo(
+                    name=node.name,
+                    line=node.lineno,
+                    parameters=[arg.arg for arg in node.args.args],
+                    is_async=isinstance(node, ast.AsyncFunctionDef),
+                ))
+            elif isinstance(node, ast.ClassDef):
+                metadata.classes.append(ClassInfo(name=node.name, line=node.lineno))
+            elif isinstance(node, ast.Import):
+                stmt = "import " + ", ".join(alias.name for alias in node.names)
+                metadata.imports.append(ImportInfo(stmt, node.lineno, node.names[0].name.split(".")[0]))
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                stmt = f"from {'.' * node.level}{module} import " + ", ".join(alias.name for alias in node.names)
+                metadata.imports.append(ImportInfo(stmt, node.lineno, module.split(".")[0], is_relative=node.level > 0))
+            elif isinstance(node, ast.Call):
+                name = self._fallback_call_name(node.func)
+                if name:
+                    metadata.calls.append(CallInfo(function=name, line=getattr(node, "lineno", 1)))
+
+    def _fallback_call_name(self, node) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = self._fallback_call_name(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        return ""
+
+    def _fallback_javascript(self, content: str, metadata: StructuralMetadata):
+        for match in re.finditer(r"^\s*import\s+[^;]+from\s+['\"]([^'\"]+)['\"]", content, re.M):
+            metadata.imports.append(ImportInfo(match.group(0), content[:match.start()].count("\n") + 1, match.group(1)))
+        for match in re.finditer(r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", content):
+            metadata.functions.append(FunctionInfo(
+                match.group(1),
+                content[:match.start()].count("\n") + 1,
+                is_async=match.group(0).lstrip().startswith("async"),
+            ))
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>", content):
+            metadata.functions.append(FunctionInfo(match.group(1), content[:match.start()].count("\n") + 1))
+        for match in re.finditer(r"\bclass\s+([A-Za-z_$][\w$]*)\b", content):
+            metadata.classes.append(ClassInfo(match.group(1), content[:match.start()].count("\n") + 1))
+
+    def _fallback_go(self, content: str, metadata: StructuralMetadata):
+        for match in re.finditer(r"^\s*import\s+[\"]([^\"]+)[\"]", content, re.M):
+            metadata.imports.append(ImportInfo(match.group(0), content[:match.start()].count("\n") + 1, match.group(1)))
+        for block in re.finditer(r"^\s*import\s*\((.*?)^\s*\)", content, re.M | re.S):
+            block_start_line = content[:block.start()].count("\n") + 1
+            for match in re.finditer(r"[\"]([^\"]+)[\"]", block.group(1)):
+                line = block_start_line + block.group(1)[:match.start()].count("\n")
+                metadata.imports.append(ImportInfo(match.group(0), line, match.group(1)))
+        for match in re.finditer(r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(", content, re.M):
+            metadata.functions.append(FunctionInfo(match.group(1), content[:match.start()].count("\n") + 1))
+        for match in re.finditer(r"^\s*type\s+([A-Za-z_]\w*)\s+struct\b", content, re.M):
+            metadata.classes.append(ClassInfo(match.group(1), content[:match.start()].count("\n") + 1))
+
+    def _analyze_python(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze Python code."""
+        # Extract functions
+        functions = self._find_nodes_by_type(root, "function_definition")
+        for func_node in functions:
+            name_node = func_node.child_by_field_name("name")
+            if name_node:
+                params = self._extract_python_params(func_node)
+                is_async = func_node.child_by_field_name("async") is not None
+
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=func_node.start_point[0] + 1,
+                    parameters=params,
+                    is_async=is_async,
+                ))
+
+        # Extract imports
+        imports = self._find_nodes_by_type(root, "import_statement")
+        for imp_node in imports:
+            statement = imp_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=imp_node.start_point[0] + 1,
+                module=self._extract_module_name(statement),
+            ))
+
+        # Extract from imports
+        from_imports = self._find_nodes_by_type(root, "import_from_statement")
+        for imp_node in from_imports:
+            statement = imp_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=imp_node.start_point[0] + 1,
+                module=self._extract_module_name(statement),
+                is_relative=statement.startswith("from ."),
+            ))
+
+        # Extract function calls
+        calls = self._find_nodes_by_type(root, "call")
+        for call_node in calls:
+            func_node = call_node.child_by_field_name("function")
+            if func_node:
+                metadata.calls.append(CallInfo(
+                    function=func_node.text.decode("utf8"),
+                    line=call_node.start_point[0] + 1,
+                ))
+
+        # Extract classes
+        classes = self._find_nodes_by_type(root, "class_definition")
+        for class_node in classes:
+            name_node = class_node.child_by_field_name("name")
+            if name_node:
+                metadata.classes.append(ClassInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=class_node.start_point[0] + 1,
+                ))
+
+        # Extract control flow (simplified for now)
+        self._extract_control_flow_python(root, metadata)
+
+    def _analyze_c_cpp(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze C/C++ code."""
+        # Extract functions
+        functions = self._find_nodes_by_type(root, "function_definition")
+        for func_node in functions:
+            declarator = func_node.child_by_field_name("declarator")
+            if declarator:
+                name = self._get_function_name_c(declarator)
+                if name:
+                    metadata.functions.append(FunctionInfo(
+                        name=name,
+                        line=func_node.start_point[0] + 1,
+                    ))
+
+        # Extract includes
+        includes = self._find_nodes_by_type(root, "preproc_include")
+        for inc_node in includes:
+            statement = inc_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=inc_node.start_point[0] + 1,
+                module=self._extract_include_name(statement),
+            ))
+
+        # Extract calls
+        calls = self._find_nodes_by_type(root, "call_expression")
+        for call_node in calls:
+            func_node = call_node.child_by_field_name("function")
+            if func_node:
+                metadata.calls.append(CallInfo(
+                    function=func_node.text.decode("utf8"),
+                    line=call_node.start_point[0] + 1,
+                ))
+
+    def _analyze_rust(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze Rust code."""
+        # Extract functions
+        functions = self._find_nodes_by_type(root, "function_item")
+        for func_node in functions:
+            name_node = func_node.child_by_field_name("name")
+            if name_node:
+                is_async = any(
+                    child.type == "async" for child in func_node.children
+                )
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=func_node.start_point[0] + 1,
+                    is_async=is_async,
+                ))
+
+        # Extract use statements
+        uses = self._find_nodes_by_type(root, "use_declaration")
+        for use_node in uses:
+            statement = use_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=use_node.start_point[0] + 1,
+                module="",
+            ))
+
+    def _analyze_go(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze Go code."""
+        # Extract functions
+        functions = self._find_nodes_by_type(root, "function_declaration")
+        for func_node in functions:
+            name_node = func_node.child_by_field_name("name")
+            if name_node:
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=func_node.start_point[0] + 1,
+                ))
+
+        # Extract imports
+        imports = self._find_nodes_by_type(root, "import_declaration")
+        for imp_node in imports:
+            statement = imp_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=imp_node.start_point[0] + 1,
+                module="",
+            ))
+
+    def _analyze_javascript(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze JavaScript/TypeScript code."""
+        # Extract functions
+        func_types = ["function_declaration", "arrow_function", "function"]
+        for func_type in func_types:
+            functions = self._find_nodes_by_type(root, func_type)
+            for func_node in functions:
+                name_node = func_node.child_by_field_name("name")
+                name = name_node.text.decode("utf8") if name_node else "anonymous"
+
+                is_async = any(
+                    child.type == "async" for child in func_node.children
+                )
+
+                metadata.functions.append(FunctionInfo(
+                    name=name,
+                    line=func_node.start_point[0] + 1,
+                    is_async=is_async,
+                ))
+
+        # Extract imports
+        imports = self._find_nodes_by_type(root, "import_statement")
+        for imp_node in imports:
+            statement = imp_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=imp_node.start_point[0] + 1,
+                module="",
+            ))
+
+    def _analyze_java(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze Java code."""
+        # Extract methods
+        methods = self._find_nodes_by_type(root, "method_declaration")
+        for method_node in methods:
+            name_node = method_node.child_by_field_name("name")
+            if name_node:
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=method_node.start_point[0] + 1,
+                ))
+
+        # Extract imports
+        imports = self._find_nodes_by_type(root, "import_declaration")
+        for imp_node in imports:
+            statement = imp_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=imp_node.start_point[0] + 1,
+                module="",
+            ))
+
+        # Extract classes
+        classes = self._find_nodes_by_type(root, "class_declaration")
+        for class_node in classes:
+            name_node = class_node.child_by_field_name("name")
+            if name_node:
+                metadata.classes.append(ClassInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=class_node.start_point[0] + 1,
+                ))
+
+    def _analyze_dart(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze Dart code."""
+        # Extract functions
+        functions = self._find_nodes_by_type(root, "function_signature")
+        for func_node in functions:
+            name_node = func_node.child_by_field_name("name")
+            if name_node:
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=func_node.start_point[0] + 1,
+                ))
+
+        # Extract imports
+        imports = self._find_nodes_by_type(root, "import_specification")
+        for imp_node in imports:
+            statement = imp_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=imp_node.start_point[0] + 1,
+                module="",
+            ))
+
+    def _analyze_php(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze PHP code."""
+        # Extract functions
+        functions = self._find_nodes_by_type(root, "function_definition")
+        for func_node in functions:
+            name_node = func_node.child_by_field_name("name")
+            if name_node:
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=func_node.start_point[0] + 1,
+                ))
+
+    def _analyze_csharp(self, root, content: str, metadata: StructuralMetadata):
+        """Analyze C# code."""
+        # Extract methods
+        methods = self._find_nodes_by_type(root, "method_declaration")
+        for method_node in methods:
+            name_node = method_node.child_by_field_name("name")
+            if name_node:
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=method_node.start_point[0] + 1,
+                ))
+
+        # Extract local functions
+        local_funcs = self._find_nodes_by_type(root, "local_function_statement")
+        for func_node in local_funcs:
+            name_node = func_node.child_by_field_name("name")
+            if name_node:
+                metadata.functions.append(FunctionInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=func_node.start_point[0] + 1,
+                ))
+
+        # Extract using directives (imports)
+        usings = self._find_nodes_by_type(root, "using_directive")
+        for using_node in usings:
+            statement = using_node.text.decode("utf8")
+            metadata.imports.append(ImportInfo(
+                statement=statement,
+                line=using_node.start_point[0] + 1,
+                module="",
+            ))
+
+        # Extract invocations (calls)
+        calls = self._find_nodes_by_type(root, "invocation_expression")
+        for call_node in calls:
+            func_node = call_node.child_by_field_name("function")
+            if func_node:
+                metadata.calls.append(CallInfo(
+                    function=func_node.text.decode("utf8"),
+                    line=call_node.start_point[0] + 1,
+                ))
+
+        # Extract classes
+        classes = self._find_nodes_by_type(root, "class_declaration")
+        for class_node in classes:
+            name_node = class_node.child_by_field_name("name")
+            if name_node:
+                metadata.classes.append(ClassInfo(
+                    name=name_node.text.decode("utf8"),
+                    line=class_node.start_point[0] + 1,
+                ))
+
+    def _find_nodes_by_type(self, root, node_type: str) -> List:
+        """Recursively find all nodes of a specific type."""
+        nodes = []
+
+        def visit(node):
+            if node.type == node_type:
+                nodes.append(node)
+            for child in node.children:
+                visit(child)
+
+        visit(root)
+        return nodes
+
+    def _extract_python_params(self, func_node) -> List[str]:
+        """Extract parameter names from Python function."""
+        params = []
+        params_node = func_node.child_by_field_name("parameters")
+        if params_node:
+            for child in params_node.children:
+                if child.type == "identifier":
+                    params.append(child.text.decode("utf8"))
+        return params
+
+    def _extract_module_name(self, statement: str) -> str:
+        """Extract module name from import statement."""
+        parts = statement.split()
+        if "import" in parts:
+            idx = parts.index("import")
+            if idx + 1 < len(parts):
+                return parts[idx + 1].split(".")[0]
+        return ""
+
+    def _extract_include_name(self, statement: str) -> str:
+        """Extract include name from C/C++ include."""
+        import re
+        match = re.search(r'[<"]([^>"]+)[>"]', statement)
+        return match.group(1) if match else ""
+
+    def _get_function_name_c(self, declarator):
+        """Extract function name from C declarator."""
+        if declarator.type == "identifier":
+            return declarator.text.decode("utf8")
+
+        for child in declarator.children:
+            if child.type == "identifier":
+                return child.text.decode("utf8")
+            name = self._get_function_name_c(child)
+            if name:
+                return name
+
+        return None
+
+    def _extract_control_flow_python(self, root, metadata: StructuralMetadata):
+        """
+        Extract control flow nodes for Python.
+
+        This provides context for AI analysis, NOT for pattern-based detection.
+        """
+        # Extract if statements
+        if_statements = self._find_nodes_by_type(root, "if_statement")
+        for if_node in if_statements:
+            condition_node = if_node.child_by_field_name("condition")
+            condition_text = condition_node.text.decode("utf8") if condition_node else None
+
+            cf_node = ControlFlowNode(
+                node_type="if",
+                line=if_node.start_point[0] + 1,
+                condition=condition_text,
+            )
+            metadata.control_flow.append(cf_node)
+
+        # Extract while loops
+        while_loops = self._find_nodes_by_type(root, "while_statement")
+        for while_node in while_loops:
+            condition_node = while_node.child_by_field_name("condition")
+            condition_text = condition_node.text.decode("utf8") if condition_node else None
+
+            cf_node = ControlFlowNode(
+                node_type="while",
+                line=while_node.start_point[0] + 1,
+                condition=condition_text,
+            )
+            metadata.control_flow.append(cf_node)
+
+        # Extract for loops
+        for_loops = self._find_nodes_by_type(root, "for_statement")
+        for for_node in for_loops:
+            cf_node = ControlFlowNode(
+                node_type="for",
+                line=for_node.start_point[0] + 1,
+            )
+            metadata.control_flow.append(cf_node)
+
+        # Extract try-except blocks
+        try_statements = self._find_nodes_by_type(root, "try_statement")
+        for try_node in try_statements:
+            cf_node = ControlFlowNode(
+                node_type="try",
+                line=try_node.start_point[0] + 1,
+            )
+            metadata.control_flow.append(cf_node)

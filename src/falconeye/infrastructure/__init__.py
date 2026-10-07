@@ -1,0 +1,1 @@
+"""Infrastructure layer - Technical implementations of domain interfaces."""

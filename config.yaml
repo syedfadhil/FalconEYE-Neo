@@ -1,0 +1,103 @@
+# FalconEYE v2.0 Configuration
+#
+# This is the default configuration file for FalconEYE.
+# You can override settings by creating ~/.falconeye/config.yaml or ./falconeye.yaml
+
+# LLM Provider Settings
+llm:
+  provider: ollama  # LLM provider (ollama, mlx)
+  model:
+    analysis: qwen3-coder:30b  # Model for security analysis
+    embedding: embeddinggemma:300m   # Model for generating embeddings
+  mlx:
+    analysis: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit  # HuggingFace model for MLX inference
+  base_url: http://localhost:11434  # Base URL for LLM API
+  timeout: 120  # Request timeout in seconds
+  max_retries: 3  # [DEPRECATED] Use retry.max_retries instead
+
+  # Retry Logic with Exponential Backoff
+  retry:
+    max_retries: 3  # Maximum number of retry attempts
+    initial_delay: 1.0  # Initial delay in seconds before first retry
+    max_delay: 30.0  # Maximum delay in seconds between retries
+    exponential_base: 2.0  # Exponential backoff base (2.0 = 1s, 2s, 4s, 8s...)
+    jitter: 0.1  # Jitter factor (0.1 = ±10% randomness to prevent thundering herd)
+
+  # Circuit Breaker Pattern
+  circuit_breaker:
+    failure_threshold: 5  # Number of failures before opening circuit
+    success_threshold: 2  # Number of successes to close circuit from half-open
+    timeout: 60.0  # Seconds to wait before transitioning to half-open
+
+# Vector Store Settings
+vector_store:
+  provider: chroma  # Vector store provider (chroma, postgres)
+  persist_directory: ./falconeye_data/vectorstore  # Storage directory
+  collection_prefix: falconeye  # Prefix for collection names
+
+# Metadata Repository Settings
+metadata:
+  provider: chroma  # Metadata provider (chroma, postgres)
+  persist_directory: ./falconeye_data/metadata  # Storage directory
+  collection_name: metadata  # Collection name
+
+# Chunking Strategy
+chunking:
+  default_size: 50  # Default lines per chunk
+  default_overlap: 10  # Default lines of overlap
+  max_chunk_size: 200  # Maximum lines per chunk
+  # Note: For files > 1000 lines, adaptive chunking automatically increases
+  # chunk size (capped at max_chunk_size) and scales overlap proportionally.
+  # The target is ~50 chunks for moderately large files; files significantly
+  # larger than ~10k lines will exceed that as the chunk size cap takes effect.
+
+# Analysis Settings
+analysis:
+  top_k_context: 5  # Number of similar chunks for RAG context
+  validate_findings: true  # Enable AI-based validation (reduces false positives)
+  batch_size: 10  # Files to process in parallel
+
+# Language Settings
+languages:
+  enabled:
+    - python
+    - javascript
+    - typescript
+    - go
+    - rust
+    - c
+    - cpp
+    - java
+    - dart
+    - php
+    - csharp
+
+# File Discovery
+file_discovery:
+  default_exclusions:
+    - "*/node_modules/*"
+    - "*/venv/*"
+    - "*/virtualenv/*"
+    - "*/.git/*"
+    - "*/dist/*"
+    - "*/build/*"
+    - "*/__pycache__/*"
+    - "*/target/*"
+    - "*.min.js"
+    - "*.pyc"
+
+# Output Settings
+output:
+  default_format: json  # Default output format (console, json, sarif, html)
+  color: true  # Enable colored console output
+  verbose: false  # Enable verbose output
+  save_to_file: true  # Save output to file (auto-saves JSON + HTML reports)
+  output_directory: ./falconeye_reports  # Directory for reports
+
+# Logging
+logging:
+  level: INFO  # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  file: ./falconeye.log  # Log file path
+  console: true  # Enable console logging
+  rotation: daily  # Log rotation strategy (daily, none)
+  retention_days: 30  # Number of days to retain logs
