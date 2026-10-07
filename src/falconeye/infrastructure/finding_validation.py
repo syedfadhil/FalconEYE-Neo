@@ -178,6 +178,42 @@ class ValidationReport:
         self.warnings.extend(other.warnings)
 
 
+# Enrichment (security_analyzer._enrich_incomplete_findings) and
+# context-enhancement (security_analyzer._extract_context_snippet)
+# prepend line-number prefixes to source lines they show the LLM:
+#     "  43 | statement"    -- context line
+#     "  43 > statement"    -- vulnerable line
+# See also PromptContext.numbered_source in domain/models/prompt.py.
+#
+# When the model copies vulnerable code into a finding's code_snippet
+# it commonly carries these prefixes over verbatim. The raw file we
+# compare against does not have them, so a naive substring check
+# reports "code_snippet not found in source file" on findings that
+# are actually perfectly grounded. Strip the prefix before matching.
+#
+# Pattern rationale:
+#   ^\s*      leading indent produced by the {:4d} width formatter
+#             (e.g. "   1", "  10", " 100", "1000")
+#   \d{1,6}   the line number itself; up to 6 digits covers any
+#             realistic source file
+#   \s+       mandatory whitespace between number and delimiter --
+#             requiring at least one space rules out real code like
+#             "1 |= flag;" which has no space before the "|"
+#   [|>]      the delimiter chosen by the analyzer
+#   \s?       optional trailing space; source indentation on the
+#             actual code follows and is preserved for _normalize
+#             to collapse uniformly
+_LINE_PREFIX_RE = re.compile(r"^\s*\d{1,6}\s+[|>]\s?", re.MULTILINE)
+
+
+def _strip_line_prefixes(text: str) -> str:
+    """
+    Remove analyzer-added line-number prefixes of the form
+    ``NNNN | `` or ``NNNN > `` (see ``_LINE_PREFIX_RE``).
+    """
+    return _LINE_PREFIX_RE.sub("", text)
+
+
 def _normalize(text: str) -> str:
     """
     Whitespace-normalize a code fragment for substring matching.
@@ -252,7 +288,14 @@ def _validate_code_snippet(
     if len(code_snippet) < 5:
         return r
 
-    normalized_snippet = _normalize(code_snippet)
+    # Strip analyzer-added line-number prefixes ("  43 | ..." or
+    # "  43 > ...") before matching. The LLM often copies these
+    # over verbatim from the numbered source we show it, but the
+    # raw file has no prefixes -- a naive substring check would
+    # then produce false "code_snippet not found in source file"
+    # warnings on well-grounded findings. See _strip_line_prefixes.
+    snippet_for_match = _strip_line_prefixes(code_snippet)
+    normalized_snippet = _normalize(snippet_for_match)
     normalized_file = _normalize(file_content)
 
     if normalized_snippet not in normalized_file:
