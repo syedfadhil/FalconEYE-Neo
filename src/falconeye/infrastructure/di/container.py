@@ -26,6 +26,8 @@ from ..persistence.checkpoint_service import CheckpointService
 from ..taint_index import TaintIndex, load_taint_index
 from ..taint_adapters.adapter_registry import AdapterRegistry
 from ..taint_adapters.csharp import CSharpTaintAdapter
+from ...domain.services.taint_verifier import TaintVerifier
+from ...application.services.taint_scan_service import TaintScanService
 
 
 @dataclass
@@ -70,6 +72,7 @@ class DIContainer:
     # this keeps startup cheap for the default install path.
     taint_index: Optional[TaintIndex] = None
     taint_adapter_registry: Optional[AdapterRegistry] = None
+    taint_scan_service: Optional[TaintScanService] = None
 
     @classmethod
     def create(cls, config_path: Optional[str] = None, backend_override: Optional[str] = None, sage_override: bool = False) -> "DIContainer":
@@ -320,6 +323,7 @@ class DIContainer:
             for lang, settings in config.languages.per_language.items()
             if settings.taint.enabled and lang in config.languages.enabled
         ]
+        taint_scan_service: Optional[TaintScanService] = None
         if taint_enabled_languages:
             taint_index = load_taint_index(languages=taint_enabled_languages)
             taint_adapter_registry = AdapterRegistry()
@@ -327,6 +331,13 @@ class DIContainer:
                 if lang == "csharp":
                     taint_adapter_registry.register(CSharpTaintAdapter())
                 # Additional adapters register here as they land.
+
+            taint_verifier = TaintVerifier(llm_service=llm_service)
+            taint_scan_service = TaintScanService(
+                adapter_registry=taint_adapter_registry,
+                taint_index=taint_index,
+                verifier=taint_verifier,
+            )
 
         return cls(
             config=config,
@@ -347,6 +358,7 @@ class DIContainer:
             checkpoint_service=checkpoint_service,
             taint_index=taint_index,
             taint_adapter_registry=taint_adapter_registry,
+            taint_scan_service=taint_scan_service,
         )
 
     def get_system_prompt(self, language: str) -> str:

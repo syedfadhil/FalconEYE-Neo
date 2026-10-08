@@ -16,6 +16,7 @@ from .commands import (
     config_command,
 )
 from .commands_upgrade import upgrade_command
+from .commands_taint import taint_command
 from .commands_projects import (
     projects_list_command,
     projects_info_command,
@@ -453,6 +454,74 @@ def upgrade():
         falconeye upgrade
     """
     upgrade_command(console=console)
+
+
+@app.command(name="taint")
+def taint(
+    path: Path = typer.Argument(
+        ...,
+        help="Path to codebase to scan for taint flows",
+        exists=True,
+    ),
+    output_format: Optional[str] = typer.Option(
+        None,
+        "--output", "-o",
+        help="Output format (console, json, sarif, html). Defaults to config.",
+    ),
+    output_file: Optional[Path] = typer.Option(
+        None,
+        "--output-file",
+        help="Save results to file",
+    ),
+    max_hops: Optional[int] = typer.Option(
+        None,
+        "--max-hops",
+        min=0,
+        max=20,
+        help="Override max_hops from config (0-20; 0 = intra-method only)",
+    ),
+    verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="LLM-verify candidate paths. --no-verify emits raw candidates tagged 'taint:unverified' -- useful for debugging.",
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config", "-c",
+        help="Path to config file",
+        exists=True,
+    ),
+):
+    """
+    Scan a codebase for taint-based vulnerabilities.
+
+    Walks the repo for source files in taint-enabled languages, builds a
+    call graph, identifies candidate source-to-sink paths, verifies each
+    candidate with an LLM, and reports confirmed findings.
+
+    Requires taint analysis to be enabled in the config file for at
+    least one language, e.g.:
+
+        languages:
+          per_language:
+            csharp:
+              taint:
+                enabled: true
+
+    Usage:
+        falconeye taint C:/path/to/repo
+        falconeye taint . --output json --output-file findings.json
+        falconeye taint . --no-verify   # dump raw candidates for debugging
+    """
+    taint_command(
+        path=path,
+        output_format=output_format,
+        output_file=output_file,
+        max_hops=max_hops,
+        verify=verify,
+        config_path=config,
+        console=console,
+    )
 
 
 # Create projects subcommand group
