@@ -17,6 +17,7 @@ from .commands import (
 )
 from .commands_upgrade import upgrade_command
 from .commands_taint import taint_command
+from .commands_skill import skill_list_command
 from .commands_projects import (
     projects_list_command,
     projects_info_command,
@@ -634,6 +635,49 @@ def projects_cleanup(
 
 # Add projects command group to main app
 app.add_typer(projects_app, name="projects")
+
+
+# Create skill subcommand group -- audit-playbook skills, Phase 1a.
+skill_app = typer.Typer(
+    name="skill",
+    help="Load and inspect security audit skills (Phase 1a: list only; run lands in Phase 1b)",
+    no_args_is_help=True,
+)
+
+
+@skill_app.command(name="list")
+def skill_list(
+    show_patterns: bool = typer.Option(
+        False,
+        "--show-patterns",
+        help="Expand each skill's Step 1 discovery patterns for inspection",
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config", "-c",
+        help="Path to config file",
+        exists=True,
+    ),
+):
+    """
+    List available skills discovered under config.skills.directory.
+
+    Prints a table of skill name, category, function, and pattern count.
+    With --show-patterns, expands each skill to show the discovery
+    patterns extracted from its Step 1 section -- useful for verifying
+    that the loader is parsing your skill files as you intended.
+
+    Requires config.skills.enabled: true and a valid skills directory.
+    """
+    skill_list_command(
+        config_path=config,
+        console=console,
+        show_patterns=show_patterns,
+    )
+
+
+app.add_typer(skill_app, name="skill")
+
 
 
 def main():

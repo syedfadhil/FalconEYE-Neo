@@ -547,6 +547,31 @@ class SAGEConfig(BaseModel):
     )
 
 
+class SkillsConfig(BaseModel):
+    """Configuration for the skill runner (audit playbooks).
+
+    Skills are external markdown files with YAML frontmatter that
+    describe structured audit procedures. When enabled, FalconEYE
+    loads them from ``directory`` and exposes them via the ``skill``
+    subcommand group. Disabled by default so a stock install has no
+    new required directories.
+    """
+    enabled: bool = Field(
+        default=False,
+        description="Enable skill loading and the `falconeye skill` subcommand"
+    )
+    directory: str = Field(
+        default="./skills",
+        description="Path to the skills directory (relative to config file, or absolute)"
+    )
+    max_discovery_hits: int = Field(
+        default=200,
+        ge=10,
+        le=2000,
+        description="Total hit cap across all discovery patterns per run"
+    )
+
+
 class FalconEyeConfig(BaseModel):
     """Complete FalconEYE configuration."""
     model_config = ConfigDict(
@@ -565,6 +590,7 @@ class FalconEyeConfig(BaseModel):
     output: OutputConfig = Field(default_factory=OutputConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     sage: SAGEConfig = Field(default_factory=SAGEConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
     def to_yaml(self) -> str:
         """Convert configuration to YAML string."""

@@ -198,3 +198,26 @@ logging:
   console: true  # Enable console logging
   rotation: daily  # Log rotation strategy (daily, none)
   retention_days: 30  # Number of days to retain logs
+
+# ============================================================================
+# Skills: structured audit playbooks (Phase 1a; disabled by default)
+# ============================================================================
+# Skills are external markdown files with YAML frontmatter that describe
+# audit procedures. When enabled, the CLI exposes `falconeye skill list`
+# to enumerate what's available. Execution (`skill run`) lands in Phase 1b.
+#
+# Uncomment and set the directory to point at your skills folder. Layout:
+#   <directory>/
+#     injection-prevention/
+#       SKILL.md
+#     path-traversal-prevention/
+#       SKILL.md
+#     _shared/                   <-- underscore-prefixed dirs are skipped
+#       report-template.md
+#
+# Relative paths resolve against the location of this config file.
+#
+# skills:
+#   enabled: true
+#   directory: ./skills
+#   max_discovery_hits: 200      # cap across all discovery patterns per run

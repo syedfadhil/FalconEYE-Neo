@@ -112,6 +112,7 @@ class ConfigLoader:
         "llm", "vector_store", "metadata", "index_registry",
         "chunking", "analysis", "languages", "file_discovery",
         "output", "logging", "sage",
+        "skills",
     }
 
     @staticmethod

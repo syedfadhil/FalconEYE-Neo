@@ -28,6 +28,7 @@ from ..taint_adapters.adapter_registry import AdapterRegistry
 from ..taint_adapters.csharp import CSharpTaintAdapter
 from ...domain.services.taint_verifier import TaintVerifier
 from ...application.services.taint_scan_service import TaintScanService
+from ..skills.skill_loader import SkillLoader
 
 
 @dataclass
@@ -73,6 +74,7 @@ class DIContainer:
     taint_index: Optional[TaintIndex] = None
     taint_adapter_registry: Optional[AdapterRegistry] = None
     taint_scan_service: Optional[TaintScanService] = None
+    skill_loader: Optional[SkillLoader] = None
 
     @classmethod
     def create(cls, config_path: Optional[str] = None, backend_override: Optional[str] = None, sage_override: bool = False) -> "DIContainer":
@@ -339,6 +341,15 @@ class DIContainer:
                 verifier=taint_verifier,
             )
 
+        skill_loader: Optional[SkillLoader] = None
+        if getattr(config, "skills", None) is not None and config.skills.enabled:
+            skills_dir = Path(config.skills.directory)
+            if not skills_dir.is_absolute() and config_path is not None:
+                # Relative directories resolve against the config file location
+                # so `directory: ./skills` in ~/proj/config.yaml means ~/proj/skills.
+                skills_dir = Path(config_path).resolve().parent / skills_dir
+            skill_loader = SkillLoader(directory=skills_dir)
+
         return cls(
             config=config,
             llm_service=llm_service,
@@ -359,6 +370,7 @@ class DIContainer:
             taint_index=taint_index,
             taint_adapter_registry=taint_adapter_registry,
             taint_scan_service=taint_scan_service,
+            skill_loader=skill_loader,
         )
 
     def get_system_prompt(self, language: str) -> str:
