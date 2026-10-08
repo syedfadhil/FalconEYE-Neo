@@ -157,3 +157,41 @@ class FileResolutionContext:
     static_usings: Tuple[str, ...] = ()
     class_fields: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     method_contexts: Mapping[str, MethodResolutionContext] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TaintPath:
+    """A candidate source-to-sink taint flow through the call graph.
+
+    Produced by :class:`TaintPathFinder`. Each path represents one
+    possible way tainted data could travel from a source to a sink,
+    based on the CALL RELATIONSHIPS in the code -- not yet confirmed
+    by data-flow analysis or LLM inspection.
+
+    The distinction between ``source`` / ``sink`` (the spec entries)
+    and ``source_caller`` / ``sink_caller`` (the user methods that
+    invoke them) matters for downstream reporting: the LLM verifier
+    reads the source of the caller methods to confirm whether the
+    tainted output of the source actually reaches the sink.
+
+    Fields:
+      source        -- canonical name of the taint source spec entry
+      sink          -- canonical name of the taint sink spec entry
+      source_caller -- canonical name of the user method calling source
+      sink_caller   -- canonical name of the user method calling sink
+      via           -- ordered chain of method canonical names from
+                       source_caller through sink_caller INCLUSIVE.
+                       For an intra-method flow (source_caller ==
+                       sink_caller), this is a 1-tuple. Length grows
+                       with inter-method hops.
+    """
+    source: str
+    sink: str
+    source_caller: str
+    sink_caller: str
+    via: Tuple[str, ...] = ()
+
+    @property
+    def hop_count(self) -> int:
+        """Number of caller-to-caller hops. 0 for intra-method flow."""
+        return max(0, len(self.via) - 1)
