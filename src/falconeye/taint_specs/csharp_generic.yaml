@@ -1,0 +1,697 @@
+# C# generic taint specification.
+#
+# Covers the .NET standard library. Framework-specific specs
+# (csharp_aspnet, csharp_efcore, csharp_dapper) build on top of this
+# via the `requires:` field. Always loaded when the csharp language
+# is enabled.
+#
+# Conventions:
+# - Constructors named `<init>`. Overloads share a canonical name;
+#   `tainted_args` selects the relevant positional arg.
+# - Property setters use the `value` keyword arg convention
+#   (matching CIL naming).
+# - CWE assignments follow ALLOWED_CWES in finding_validation.py.
+# - Severity is HIGH by default for injection sinks, CRITICAL for
+#   code execution and unsafe deserialization.
+
+version: 1
+language: csharp
+
+# ======================================================================
+# SOURCES
+# ======================================================================
+
+sources:
+
+  # -- stdin, environment, args ----------------------------------------
+
+  - name: csharp:System.Console.ReadLine
+    kind: stdin
+    taints: return
+
+  - name: csharp:System.Console.In
+    kind: stdin
+    taints: return
+    notes: TextReader; further Read* calls on this are also sources.
+
+  - name: csharp:System.Environment.GetEnvironmentVariable
+    kind: env_var
+    taints: return
+
+  - name: csharp:System.Environment.GetEnvironmentVariables
+    kind: env_var
+    taints: return
+
+  - name: csharp:System.Environment.GetCommandLineArgs
+    kind: cli_arg
+    taints: return
+
+  - name: csharp:System.Environment.CommandLine
+    kind: cli_arg
+    taints: return
+
+  # -- filesystem reads (file_content family) --------------------------
+
+  - name: csharp:System.IO.File.ReadAllText
+    kind: file_content
+    taints: return
+
+  - name: csharp:System.IO.File.ReadAllBytes
+    kind: file_content
+    taints: return
+
+  - name: csharp:System.IO.File.ReadAllLines
+    kind: file_content
+    taints: return
+
+  - name: csharp:System.IO.File.ReadLines
+    kind: file_content
+    taints: return
+
+  - name: csharp:System.IO.File.OpenRead
+    kind: file_content
+    taints: return
+    notes: FileStream; downstream reads produce tainted bytes.
+
+  - name: csharp:System.IO.File.OpenText
+    kind: file_content
+    taints: return
+
+  - name: csharp:System.IO.StreamReader.<init>
+    kind: file_content
+    taints: this
+
+  - name: csharp:System.IO.StreamReader.ReadToEnd
+    kind: file_content
+    taints: return
+
+  - name: csharp:System.IO.StreamReader.ReadLine
+    kind: file_content
+    taints: return
+
+  - name: csharp:System.IO.StreamReader.ReadLineAsync
+    kind: file_content
+    taints: return
+
+  # -- network reads (attacker-controlled remote endpoints) ------------
+
+  - name: csharp:System.Net.Http.HttpResponseMessage.Content
+    kind: network_response
+    taints: return
+
+  - name: csharp:System.Net.Http.HttpContent.ReadAsStringAsync
+    kind: network_response
+    taints: return
+
+  - name: csharp:System.Net.Http.HttpContent.ReadAsByteArrayAsync
+    kind: network_response
+    taints: return
+
+  - name: csharp:System.Net.WebResponse.GetResponseStream
+    kind: network_response
+    taints: return
+
+
+# ======================================================================
+# SINKS
+# ======================================================================
+
+sinks:
+
+  # -- SQL injection --------------------------------------------------
+
+  - name: csharp:System.Data.SqlClient.SqlCommand.<init>
+    kind: sql_query
+    tainted_args: [0]
+    cwe: CWE-89
+    severity: HIGH
+    notes: >
+      Constructor overload SqlCommand(string, SqlConnection[, ...]).
+      Arg 0 is the SQL text. Also covers Microsoft.Data.SqlClient
+      (canonical name form matched via namespace alias in adapter).
+
+  - name: csharp:Microsoft.Data.SqlClient.SqlCommand.<init>
+    kind: sql_query
+    tainted_args: [0]
+    cwe: CWE-89
+    severity: HIGH
+
+  - name: csharp:System.Data.SqlClient.SqlCommand.CommandText
+    kind: sql_query
+    tainted_args: [value]
+    cwe: CWE-89
+    severity: HIGH
+    notes: Property setter. Same danger as passing SQL to the constructor.
+
+  - name: csharp:Microsoft.Data.SqlClient.SqlCommand.CommandText
+    kind: sql_query
+    tainted_args: [value]
+    cwe: CWE-89
+    severity: HIGH
+
+  - name: csharp:System.Data.OleDb.OleDbCommand.<init>
+    kind: sql_query
+    tainted_args: [0]
+    cwe: CWE-89
+    severity: HIGH
+
+  - name: csharp:System.Data.OleDb.OleDbCommand.CommandText
+    kind: sql_query
+    tainted_args: [value]
+    cwe: CWE-89
+    severity: HIGH
+
+  - name: csharp:System.Data.Odbc.OdbcCommand.<init>
+    kind: sql_query
+    tainted_args: [0]
+    cwe: CWE-89
+    severity: HIGH
+
+  - name: csharp:System.Data.Odbc.OdbcCommand.CommandText
+    kind: sql_query
+    tainted_args: [value]
+    cwe: CWE-89
+    severity: HIGH
+
+  # -- command execution ----------------------------------------------
+
+  - name: csharp:System.Diagnostics.Process.Start
+    kind: command_exec
+    tainted_args: [any]
+    cwe: CWE-78
+    severity: CRITICAL
+    notes: >
+      Multiple overloads. Process.Start(string) executes a path;
+      Process.Start(string, string) adds argv; both are dangerous if
+      either arg carries taint.
+
+  - name: csharp:System.Diagnostics.ProcessStartInfo.<init>
+    kind: command_exec
+    tainted_args: [0, 1]
+    cwe: CWE-78
+    severity: CRITICAL
+    notes: ProcessStartInfo(fileName) and ProcessStartInfo(fileName, args).
+
+  - name: csharp:System.Diagnostics.ProcessStartInfo.FileName
+    kind: command_exec
+    tainted_args: [value]
+    cwe: CWE-78
+    severity: CRITICAL
+
+  - name: csharp:System.Diagnostics.ProcessStartInfo.Arguments
+    kind: command_exec
+    tainted_args: [value]
+    cwe: CWE-78
+    severity: CRITICAL
+
+  # -- path traversal / arbitrary file access -------------------------
+
+  - name: csharp:System.IO.File.WriteAllText
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+    notes: Arg 0 is the file path. Content arg is not a path sink.
+
+  - name: csharp:System.IO.File.WriteAllBytes
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  - name: csharp:System.IO.File.WriteAllLines
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  - name: csharp:System.IO.File.AppendAllText
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  - name: csharp:System.IO.File.OpenWrite
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  - name: csharp:System.IO.File.Open
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  - name: csharp:System.IO.File.Create
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  - name: csharp:System.IO.File.Delete
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  - name: csharp:System.IO.FileStream.<init>
+    kind: path_traversal
+    tainted_args: [0]
+    cwe: CWE-22
+    severity: HIGH
+
+  # -- XXE / XML parsing ----------------------------------------------
+
+  - name: csharp:System.Xml.XmlDocument.LoadXml
+    kind: xxe
+    tainted_args: [0]
+    cwe: CWE-611
+    severity: HIGH
+    notes: >
+      XmlDocument uses an entity-resolving parser by default in older
+      .NET Framework versions. Modern .NET Core / .NET 5+ hardens this,
+      but the sink is always risky enough to flag; verifier can
+      downgrade based on framework version.
+
+  - name: csharp:System.Xml.XmlDocument.Load
+    kind: xxe
+    tainted_args: [0]
+    cwe: CWE-611
+    severity: HIGH
+
+  - name: csharp:System.Xml.XmlReader.Create
+    kind: xxe
+    tainted_args: [0]
+    cwe: CWE-611
+    severity: MEDIUM
+    notes: >
+      XmlReader is only vulnerable when constructed without a hardened
+      XmlReaderSettings (DtdProcessing=Prohibit). MEDIUM by default so
+      verifier can promote to HIGH if the settings arg is null or a
+      permissive settings object.
+
+  - name: csharp:System.Xml.XPath.XPathNavigator.Evaluate
+    kind: xpath_injection
+    tainted_args: [0]
+    cwe: CWE-643
+    severity: HIGH
+
+  - name: csharp:System.Xml.XPath.XPathExpression.Compile
+    kind: xpath_injection
+    tainted_args: [0]
+    cwe: CWE-643
+    severity: HIGH
+
+  # -- deserialization ------------------------------------------------
+
+  - name: csharp:System.Runtime.Serialization.Formatters.Binary.BinaryFormatter.Deserialize
+    kind: deserialization
+    tainted_args: [0]
+    cwe: CWE-502
+    severity: CRITICAL
+    notes: >
+      BinaryFormatter is unsafe by design. Any attacker-controlled
+      input to Deserialize is game-over; Microsoft has explicitly
+      deprecated it.
+
+  - name: csharp:System.Runtime.Serialization.NetDataContractSerializer.Deserialize
+    kind: deserialization
+    tainted_args: [0]
+    cwe: CWE-502
+    severity: CRITICAL
+
+  - name: csharp:System.Web.UI.LosFormatter.Deserialize
+    kind: deserialization
+    tainted_args: [0]
+    cwe: CWE-502
+    severity: CRITICAL
+
+  - name: csharp:Newtonsoft.Json.JsonConvert.DeserializeObject
+    kind: deserialization
+    tainted_args: [0]
+    cwe: CWE-502
+    severity: MEDIUM
+    notes: >
+      Safe by default. Escalates to CRITICAL when TypeNameHandling is
+      anything other than None -- the verifier LLM should read the
+      settings arg to make that call.
+
+  - name: csharp:System.Xml.Serialization.XmlSerializer.Deserialize
+    kind: deserialization
+    tainted_args: [0]
+    cwe: CWE-502
+    severity: MEDIUM
+    notes: Safe when the type is fixed; risky with dynamic type resolution.
+
+  # -- SSRF -----------------------------------------------------------
+
+  - name: csharp:System.Net.Http.HttpClient.GetAsync
+    kind: ssrf
+    tainted_args: [0]
+    cwe: CWE-918
+    severity: HIGH
+
+  - name: csharp:System.Net.Http.HttpClient.PostAsync
+    kind: ssrf
+    tainted_args: [0]
+    cwe: CWE-918
+    severity: HIGH
+
+  - name: csharp:System.Net.Http.HttpClient.SendAsync
+    kind: ssrf
+    tainted_args: [0]
+    cwe: CWE-918
+    severity: HIGH
+
+  - name: csharp:System.Net.WebRequest.Create
+    kind: ssrf
+    tainted_args: [0]
+    cwe: CWE-918
+    severity: HIGH
+
+  # -- code injection / dynamic loading -------------------------------
+
+  - name: csharp:System.Reflection.Assembly.Load
+    kind: code_injection
+    tainted_args: [0]
+    cwe: CWE-94
+    severity: CRITICAL
+
+  - name: csharp:System.Reflection.Assembly.LoadFrom
+    kind: code_injection
+    tainted_args: [0]
+    cwe: CWE-94
+    severity: CRITICAL
+
+  - name: csharp:System.Reflection.Assembly.LoadFile
+    kind: code_injection
+    tainted_args: [0]
+    cwe: CWE-94
+    severity: CRITICAL
+
+  - name: csharp:System.Activator.CreateInstance
+    kind: code_injection
+    tainted_args: [0]
+    cwe: CWE-94
+    severity: HIGH
+    notes: >
+      Dangerous when arg 0 is a Type or type-name string resolved from
+      user input. Safe with a fixed typeof(T) expression -- verifier
+      will distinguish.
+
+  - name: csharp:System.Type.GetType
+    kind: code_injection
+    tainted_args: [0]
+    cwe: CWE-94
+    severity: MEDIUM
+
+
+# ======================================================================
+# SANITIZERS
+# ======================================================================
+
+sanitizers:
+
+  # -- SQL parameterization -------------------------------------------
+
+  - name: csharp:System.Data.SqlClient.SqlParameter.<init>
+    sanitizes_kind: sql_query
+    at: return
+    notes: >
+      Standard SqlServer parameterization. Any string wrapped in a
+      SqlParameter is safe at a downstream SqlCommand sink even if the
+      underlying value was tainted.
+
+  - name: csharp:Microsoft.Data.SqlClient.SqlParameter.<init>
+    sanitizes_kind: sql_query
+    at: return
+
+  - name: csharp:System.Data.OleDb.OleDbParameter.<init>
+    sanitizes_kind: sql_query
+    at: return
+
+  - name: csharp:System.Data.Odbc.OdbcParameter.<init>
+    sanitizes_kind: sql_query
+    at: return
+
+  - name: csharp:System.Data.SqlClient.SqlCommand.Parameters.AddWithValue
+    sanitizes_kind: sql_query
+    at: arg:1
+    notes: >
+      AddWithValue(name, value) parameterizes the value arg. The
+      resulting collection is safe when passed to a Command sink.
+
+  # -- HTML / URL encoding --------------------------------------------
+
+  - name: csharp:System.Net.WebUtility.HtmlEncode
+    sanitizes_kind: [xss, html_injection]
+    at: return
+
+  - name: csharp:System.Web.HttpUtility.HtmlEncode
+    sanitizes_kind: [xss, html_injection]
+    at: return
+
+  - name: csharp:System.Web.HttpUtility.HtmlAttributeEncode
+    sanitizes_kind: [xss, html_injection]
+    at: return
+
+  - name: csharp:System.Net.WebUtility.UrlEncode
+    sanitizes_kind: http_url
+    at: return
+
+  - name: csharp:System.Web.HttpUtility.UrlEncode
+    sanitizes_kind: http_url
+    at: return
+
+  - name: csharp:System.Web.HttpUtility.JavaScriptStringEncode
+    sanitizes_kind: xss
+    at: return
+
+  # -- path canonicalization / restriction ----------------------------
+
+  - name: csharp:System.IO.Path.GetFileName
+    sanitizes_kind: path_traversal
+    at: return
+    notes: >
+      Discards directory components, returning only the filename.
+      Neutralizes ../ traversal but not filename-based attacks
+      (extension confusion, symlinks in the target dir).
+    partial: true
+
+  # -- type casts (universal neutralizers) ----------------------------
+
+  - name: csharp:System.Convert.ToInt32
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Convert.ToInt64
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Convert.ToBoolean
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Convert.ToDouble
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Convert.ToDateTime
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Int32.Parse
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Int32.TryParse
+    sanitizes_kind: "*"
+    at: arg:1
+    notes: >
+      out-parameter TryParse. Sanitizes the out-param when the call
+      returns true; conservatively treat as always sanitized.
+
+  - name: csharp:System.Int64.Parse
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Int64.TryParse
+    sanitizes_kind: "*"
+    at: arg:1
+
+  - name: csharp:System.Guid.Parse
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.Guid.TryParse
+    sanitizes_kind: "*"
+    at: arg:1
+
+  - name: csharp:System.DateTime.Parse
+    sanitizes_kind: "*"
+    at: return
+
+  - name: csharp:System.DateTime.TryParse
+    sanitizes_kind: "*"
+    at: arg:1
+
+
+# ======================================================================
+# PROPAGATORS
+# ======================================================================
+#
+# Only precision-tuning entries live here. When a callee has no
+# propagator entry (and no source/sink/sanitizer entry), the loader
+# falls back to the conservative default: any tainted arg or `this`
+# taints all reference-type outputs.
+
+propagators:
+
+  # -- string composition -- most common taint carriers ---------------
+
+  - name: csharp:System.String.Concat
+    rule: taint_return_if_any_arg_tainted
+
+  - name: csharp:System.String.Format
+    rule: taint_return_if_any_arg_tainted
+    exclude_args: [0]
+    notes: Arg 0 is the format string; format specifiers alone can't taint output.
+
+  - name: csharp:System.String.Join
+    rule: taint_return_if_any_arg_tainted
+
+  - name: csharp:System.String.op_Addition
+    rule: taint_return_if_any_arg_tainted
+    notes: The `+` operator on strings.
+
+  - name: csharp:System.String.Replace
+    rule: taint_return_if_this_tainted
+    notes: >
+      Replacement args technically could re-taint a clean string but
+      that pattern is uncommon; keeping this conservative-simple.
+
+  - name: csharp:System.String.Substring
+    rule: taint_return_if_this_tainted
+
+  - name: csharp:System.String.ToLower
+    rule: taint_return_if_this_tainted
+
+  - name: csharp:System.String.ToUpper
+    rule: taint_return_if_this_tainted
+
+  - name: csharp:System.String.Trim
+    rule: taint_return_if_this_tainted
+
+  - name: csharp:System.String.TrimStart
+    rule: taint_return_if_this_tainted
+
+  - name: csharp:System.String.TrimEnd
+    rule: taint_return_if_this_tainted
+
+  - name: csharp:System.String.Split
+    rule: taint_return_if_this_tainted
+
+  - name: csharp:System.String.Insert
+    rule: taint_return_if_any_arg_tainted
+
+  - name: csharp:System.String.Remove
+    rule: taint_return_if_this_tainted
+
+  # -- StringBuilder (mutators + reader) ------------------------------
+
+  - name: csharp:System.Text.StringBuilder.Append
+    rule: taint_this_if_arg_tainted
+
+  - name: csharp:System.Text.StringBuilder.AppendLine
+    rule: taint_this_if_arg_tainted
+
+  - name: csharp:System.Text.StringBuilder.AppendFormat
+    rule: taint_this_if_arg_tainted
+    exclude_args: [0]
+
+  - name: csharp:System.Text.StringBuilder.Insert
+    rule: taint_this_if_arg_tainted
+    exclude_args: [0]
+    notes: Arg 0 is the insert index (int); only string args carry taint.
+
+  - name: csharp:System.Text.StringBuilder.Replace
+    rule: taint_this_if_arg_tainted
+
+  - name: csharp:System.Text.StringBuilder.ToString
+    rule: taint_return_if_this_tainted
+
+  # -- Path composition -----------------------------------------------
+
+  - name: csharp:System.IO.Path.Combine
+    rule: taint_return_if_any_arg_tainted
+    notes: >
+      Path.Combine does NOT sanitize traversal sequences -- ../ in
+      any arg propagates to the return. Do not confuse with
+      Path.GetFullPath which canonicalizes.
+
+  - name: csharp:System.IO.Path.Join
+    rule: taint_return_if_any_arg_tainted
+
+  # -- Uri / URL composition ------------------------------------------
+
+  - name: csharp:System.Uri.<init>
+    rule: taint_this_if_arg_tainted
+
+  - name: csharp:System.UriBuilder.<init>
+    rule: taint_this_if_arg_tainted
+
+  - name: csharp:System.UriBuilder.Uri
+    rule: taint_return_if_this_tainted
+
+  # -- Encoding conversions (bytes <-> string) ------------------------
+
+  - name: csharp:System.Text.Encoding.GetString
+    rule: taint_return_if_any_arg_tainted
+
+  - name: csharp:System.Text.Encoding.GetBytes
+    rule: taint_return_if_any_arg_tainted
+
+  - name: csharp:System.Convert.FromBase64String
+    rule: taint_return_if_any_arg_tainted
+
+  - name: csharp:System.Convert.ToBase64String
+    rule: taint_return_if_any_arg_tainted
+
+  # -- explicit "no taint" declarations for value-type accessors -----
+  # These are precision wins: without them the conservative default
+  # would flag `int length = tainted.Length` as producing tainted int.
+
+  - name: csharp:System.String.Length
+    rule: no_propagation
+
+  - name: csharp:System.Array.Length
+    rule: no_propagation
+
+  - name: csharp:System.Collections.ICollection.Count
+    rule: no_propagation
+
+  - name: csharp:System.String.IsNullOrEmpty
+    rule: no_propagation
+
+  - name: csharp:System.String.IsNullOrWhiteSpace
+    rule: no_propagation
+
+  - name: csharp:System.String.Equals
+    rule: no_propagation
+
+  - name: csharp:System.String.Contains
+    rule: no_propagation
+    notes: Returns bool; the check does not itself taint anything downstream.
+
+  - name: csharp:System.String.StartsWith
+    rule: no_propagation
+
+  - name: csharp:System.String.EndsWith
+    rule: no_propagation
+
+  - name: csharp:System.String.IndexOf
+    rule: no_propagation
+
+  - name: csharp:System.String.GetHashCode
+    rule: no_propagation

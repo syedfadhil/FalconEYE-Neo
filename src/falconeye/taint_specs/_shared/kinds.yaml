@@ -1,0 +1,197 @@
+# Canonical taint-kind vocabulary shared across all languages.
+#
+# A kind is a category of taint. Sources introduce a kind; sinks are
+# dangerous WHEN receiving that kind; sanitizers neutralize a kind (or
+# a whole family via an abstract parent kind).
+#
+# Design notes:
+# - Kind names use snake_case and describe the *nature* of the data,
+#   not the *language* it's from. `http_query` is the same concept
+#   whether the source is Flask's request.args, ASP.NET's Request.Query,
+#   or Java's HttpServletRequest.getParameter.
+# - Parents let sanitizers cover a whole family. HtmlEncode sanitizes
+#   `xss` specifically, but a hypothetical universal-injection filter
+#   would sanitize `injection` (parent) and thereby cover every child.
+# - `abstract: true` kinds may not be attached to concrete sources or
+#   sinks -- only sanitizers can target them. This keeps concrete
+#   entries pinned to a specific category.
+# - `default_cwe:` on a kind is the CWE assigned to findings on that
+#   kind when the sink entry doesn't override. Must appear in the
+#   ALLOWED_CWES list in infrastructure/finding_validation.py.
+
+version: 1
+
+kinds:
+
+  # -------------------------------------------------------------------
+  # SOURCE FAMILIES -- untrusted data entering the program
+  # -------------------------------------------------------------------
+
+  user_input:
+    abstract: true
+    description: Umbrella for anything under the attacker's control.
+
+  http_query:
+    parent: user_input
+    description: Query-string parameter from an HTTP request.
+
+  http_form:
+    parent: user_input
+    description: Form field (application/x-www-form-urlencoded, multipart).
+
+  http_header:
+    parent: user_input
+    description: Request header value.
+
+  http_body:
+    parent: user_input
+    description: Raw request body (JSON, XML, or other content).
+
+  http_url:
+    parent: user_input
+    description: Request URL, path, or route parameter.
+
+  http_cookie:
+    parent: user_input
+    description: Cookie value from an incoming request.
+
+  file_content:
+    parent: user_input
+    description: >
+      Content read from a file. Assumed untrusted because attackers who
+      can influence file contents (uploads, shared dirs) are common.
+
+  env_var:
+    parent: user_input
+    description: >
+      Environment variable value. Attacker-controllable in many
+      deployment contexts (shared hosting, CI, containerized apps).
+
+  cli_arg:
+    parent: user_input
+    description: Command-line argument to the program.
+
+  stdin:
+    parent: user_input
+    description: Data read from standard input.
+
+  network_response:
+    parent: user_input
+    description: >
+      Response body from an outbound network call. The remote endpoint
+      may be attacker-controlled or compromised.
+
+  db_read:
+    parent: user_input
+    description: >
+      Data read from a database. Second-order injection: the row was
+      likely written by a user input at an earlier point. Treated as
+      tainted for downstream sinks.
+
+  # -------------------------------------------------------------------
+  # SINK FAMILIES -- what the taint is dangerous FOR
+  # -------------------------------------------------------------------
+
+  injection:
+    abstract: true
+    description: Untrusted string interpreted as code by a downstream engine.
+
+  sql_query:
+    parent: injection
+    default_cwe: CWE-89
+    description: SQL statement text passed to a database engine.
+
+  command_exec:
+    parent: injection
+    default_cwe: CWE-78
+    description: Command line or process argv passed to an OS shell/spawn.
+
+  xss:
+    parent: injection
+    default_cwe: CWE-79
+    description: HTML content rendered in a browser.
+
+  html_injection:
+    parent: injection
+    default_cwe: CWE-79
+    description: >
+      Non-JS HTML content injection. Distinct from xss when the sink
+      is server-rendered but not attacker-scriptable (e.g. email body).
+
+  path_traversal:
+    parent: injection
+    default_cwe: CWE-22
+    description: File path passed to a filesystem operation.
+
+  ldap_query:
+    parent: injection
+    default_cwe: CWE-77
+    description: >
+      LDAP filter or DN passed to a directory service. Uses CWE-77
+      (generic command injection) as the closest ALLOWED_CWES entry
+      until a dedicated CWE-90 entry is added.
+
+  xpath_injection:
+    parent: injection
+    default_cwe: CWE-643
+    description: XPath expression evaluated against a document.
+
+  xxe:
+    parent: injection
+    default_cwe: CWE-611
+    description: >
+      XML content parsed by an entity-resolving parser. Separate from
+      the parser being misconfigured -- xxe is the taint category;
+      whether the parser is dangerous is a sink attribute.
+
+  ssti:
+    parent: injection
+    default_cwe: CWE-1336
+    description: Server-side template expression rendered by a template engine.
+
+  code_injection:
+    parent: injection
+    default_cwe: CWE-94
+    description: >
+      Type name, assembly name, or code fragment loaded/evaluated as
+      program code (Assembly.Load, eval, exec, Activator.CreateInstance).
+
+  no_sql_injection:
+    parent: injection
+    default_cwe: CWE-89
+    description: >
+      Query object or JSON expression passed to a NoSQL engine.
+      Uses CWE-89 (SQL injection) as the closest ALLOWED_CWES entry
+      until a dedicated CWE-943 entry is added.
+
+  # -------------------------------------------------------------------
+  # STANDALONE KINDS -- not part of an injection family
+  # -------------------------------------------------------------------
+
+  deserialization:
+    default_cwe: CWE-502
+    description: >
+      Bytes or string reconstructed into program objects by an unsafe
+      deserializer (BinaryFormatter, pickle, ObjectInputStream, etc.).
+
+  ssrf:
+    default_cwe: CWE-918
+    description: >
+      URL passed to a client that will fetch it, potentially reaching
+      internal services or metadata endpoints.
+
+  open_redirect:
+    default_cwe: CWE-601
+    description: URL passed to a Redirect() sink.
+
+  sensitive_log:
+    default_cwe: CWE-532
+    description: >
+      Secrets or PII written to a log sink. Sink perspective; the
+      corresponding sources are values marked as sensitive.
+
+  weak_random:
+    default_cwe: CWE-338
+    description: >
+      Value produced by a non-cryptographic RNG used in a security
+      context (token generation, key derivation).
