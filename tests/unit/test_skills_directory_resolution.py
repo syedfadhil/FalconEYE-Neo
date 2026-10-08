@@ -6,6 +6,9 @@ Covers:
   * Tilde and $VAR expansion
   * Relative-config-path resolution against config file location
   * ``--skills-dir`` CLI override bypasses config gating
+
+Assertions compare ``Path`` objects rather than ``str(path)`` so they
+hold on Windows, where ``str(Path("/tmp/x"))`` is ``\\tmp\\x``.
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ def test_resolve_env_var_wins_over_config(monkeypatch):
         config_value="/config/value/skills",
         config_path="/proj/config.yaml",
     )
-    assert str(result) == "/tmp/env-override"
+    assert result == Path("/tmp/env-override")
 
 
 @pytest.mark.unit
@@ -67,14 +70,19 @@ def test_resolve_env_var_expands_tilde(monkeypatch):
 
 
 @pytest.mark.unit
-def test_resolve_env_var_expands_shell_var(monkeypatch):
-    """$VAR expansion works too (via os.path.expandvars)."""
-    monkeypatch.setenv("FALCONEYE_SKILLS_DIR", "$HOME/env-var")
+def test_resolve_env_var_expands_shell_var(monkeypatch, tmp_path):
+    """$VAR expansion works too (via os.path.expandvars).
+
+    Uses a test-owned variable rather than $HOME: Windows doesn't set
+    HOME by default (Path.home() reads USERPROFILE there).
+    """
+    monkeypatch.setenv("FALCONEYE_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("FALCONEYE_SKILLS_DIR", "$FALCONEYE_TEST_ROOT/env-var")
     result = _resolve_skills_directory(
         config_value="ignored",
         config_path=None,
     )
-    assert result == Path.home() / "env-var"
+    assert result == tmp_path / "env-var"
 
 
 @pytest.mark.unit
@@ -85,7 +93,7 @@ def test_resolve_empty_env_var_falls_through(monkeypatch):
         config_value="/absolute/config",
         config_path=None,
     )
-    assert str(result) == "/absolute/config"
+    assert result == Path("/absolute/config")
 
 
 @pytest.mark.unit
@@ -96,18 +104,24 @@ def test_resolve_whitespace_env_var_falls_through(monkeypatch):
         config_value="/absolute/config",
         config_path=None,
     )
-    assert str(result) == "/absolute/config"
+    assert result == Path("/absolute/config")
 
 
 @pytest.mark.unit
-def test_resolve_config_absolute_stays_absolute(monkeypatch):
-    """An absolute config value is not re-parented on config_path."""
+def test_resolve_config_absolute_stays_absolute(monkeypatch, tmp_path):
+    """An absolute config value is not re-parented on config_path.
+
+    Built from tmp_path so it's absolute on every OS: a bare
+    "/absolute/skills" has no drive letter, so Windows treats it as
+    relative and the resolver (correctly) re-parents it.
+    """
     monkeypatch.delenv("FALCONEYE_SKILLS_DIR", raising=False)
+    absolute = tmp_path / "absolute" / "skills"
     result = _resolve_skills_directory(
-        config_value="/absolute/skills",
+        config_value=str(absolute),
         config_path="/proj/config.yaml",
     )
-    assert str(result) == "/absolute/skills"
+    assert result == absolute
 
 
 @pytest.mark.unit
@@ -201,7 +215,9 @@ def test_cli_skills_dir_override_bypasses_config_gating(tmp_path, monkeypatch):
 @pytest.mark.unit
 def test_cli_skills_dir_override_expands_tilde(tmp_path, monkeypatch):
     """A ~-prefixed --skills-dir gets expanded before loading."""
+    # expanduser reads HOME on POSIX but USERPROFILE on Windows.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     skills_dir = tmp_path / "custom-skills"
     skills_dir.mkdir()
     _write_skill(skills_dir, "hello", textwrap.dedent("""\
