@@ -417,6 +417,65 @@ class HTMLFormatter(OutputFormatter):
             background: #f0fdf4;
             color: #16a34a;
         }}
+
+        /* Taint reachability badges */
+        .badge.taint-reachable {{
+            background: #dcfce7;
+            color: #15803d;
+        }}
+
+        .badge.taint-not-confirmed {{
+            background: #fef9c3;
+            color: #a16207;
+        }}
+
+        .badge.taint-no-method {{
+            background: #f3f4f6;
+            color: #6b7280;
+        }}
+
+        .badge.taint-skipped {{
+            background: #f3f4f6;
+            color: #9ca3af;
+        }}
+
+        /* Taint reachability section (left border for at-a-glance status) */
+        .taint-reachable-section {{
+            border-left: 4px solid #16a34a;
+            padding-left: 12px;
+            background: #f0fdf4;
+            border-radius: 4px;
+        }}
+
+        .taint-not-confirmed-section {{
+            border-left: 4px solid #d97706;
+            padding-left: 12px;
+            background: #fefce8;
+            border-radius: 4px;
+        }}
+
+        .taint-no-method-section {{
+            border-left: 4px solid #9ca3af;
+            padding-left: 12px;
+            background: #f9fafb;
+            border-radius: 4px;
+        }}
+
+        .taint-skipped-section {{
+            border-left: 4px solid #d1d5db;
+            padding-left: 12px;
+            background: #f9fafb;
+            border-radius: 4px;
+        }}
+
+        .taint-chain {{
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 0.9em;
+            background: rgba(255, 255, 255, 0.6);
+            padding: 6px 10px;
+            border-radius: 4px;
+            display: inline-block;
+        }}
         
         .finding-location {{
             color: #6b7280;
@@ -764,6 +823,7 @@ class HTMLFormatter(OutputFormatter):
                 <div class="badges">
                     <span class="badge {severity}">{severity}</span>
                     <span class="badge confidence">{confidence}</span>
+                    {self._render_taint_badge(finding)}
                 </div>
             </div>
             
@@ -869,7 +929,113 @@ class HTMLFormatter(OutputFormatter):
                 + '</div>'
             )
 
+        # Taint reachability confirmation (from --confirm-taint).
+        # Only rendered when confirmation was actually run on this
+        # finding; older findings without the field render normally.
+        taint_block = self._render_taint_confirmation_section(finding)
+        if taint_block:
+            blocks.append(taint_block)
+
         return "\n".join(blocks)
+
+    def _render_taint_badge(self, finding: SecurityFinding) -> str:
+        """Render the small taint-status badge in the finding header.
+
+        Returns an empty string when confirmation was not run so the
+        header stays clean for legacy findings and reviews without
+        --confirm-taint.
+        """
+        conf = getattr(finding, "taint_confirmation", None)
+        if conf is None:
+            return ""
+        cls, label = self._taint_badge_style(conf.status)
+        return f'<span class="badge {cls}">{self._escape_html(label)}</span>'
+
+    def _render_taint_confirmation_section(self, finding: SecurityFinding) -> str:
+        """Render the detailed taint-confirmation block.
+
+        Shows the enclosing method, reachable entry points, shortest
+        chain (with short names, not fully-qualified), hop count, and
+        the plain-English reason. Color-coded by status via CSS
+        classes defined at the top of the document. Returns "" when
+        confirmation was not run.
+        """
+        conf = getattr(finding, "taint_confirmation", None)
+        if conf is None:
+            return ""
+
+        section_cls = {
+            "confirmed_reachable": "taint-reachable-section",
+            "not_confirmed": "taint-not-confirmed-section",
+            "no_enclosing_method": "taint-no-method-section",
+            "no_entry_points": "taint-no-method-section",
+            "skipped": "taint-skipped-section",
+        }.get(conf.status, "taint-skipped-section")
+
+        rows = [f'<h4>Taint Reachability: {self._escape_html(conf.status)}</h4>']
+
+        if conf.enclosing_function:
+            rows.append(
+                f'<p><strong>Enclosing method:</strong> '
+                f'<code>{self._escape_html(conf.enclosing_function)}</code></p>'
+            )
+
+        if conf.status == "confirmed_reachable":
+            if conf.hop_count is not None:
+                hop_word = "hop" if conf.hop_count == 1 else "hops"
+                rows.append(
+                    f'<p><strong>Distance:</strong> {conf.hop_count} {hop_word} '
+                    f'from the nearest entry point</p>'
+                )
+            if conf.reachable_entry_points:
+                n = len(conf.reachable_entry_points)
+                word = "entry point" if n == 1 else "entry points"
+                # Show short names (last segment) for readability, but
+                # link the full canonical names as a code block.
+                short_names = [
+                    ep.rsplit(".", 1)[-1] if "." in ep else ep
+                    for ep in conf.reachable_entry_points
+                ]
+                rows.append(
+                    f'<p><strong>Reachable from {n} {word}:</strong> '
+                    f'{", ".join(self._escape_html(n) for n in short_names)}</p>'
+                )
+            if conf.shortest_chain:
+                short_chain = [
+                    n.rsplit(".", 1)[-1] if "." in n else n
+                    for n in conf.shortest_chain
+                ]
+                chain_html = self._escape_html(" -> ".join(short_chain))
+                rows.append(
+                    f'<p><strong>Shortest chain:</strong> '
+                    f'<span class="taint-chain">{chain_html}</span></p>'
+                )
+
+        if conf.reason:
+            rows.append(
+                f'<p><strong>Reason:</strong> {self._escape_html(conf.reason)}</p>'
+            )
+
+        return (
+            f'<div class="finding-section {section_cls}">'
+            + "".join(rows)
+            + "</div>"
+        )
+
+    @staticmethod
+    def _taint_badge_style(status: str) -> "tuple[str, str]":
+        """Map a taint-confirmation status to (CSS class, short label).
+
+        Short labels keep the finding header compact -- the full
+        status appears in the detailed section below.
+        """
+        return {
+            "confirmed_reachable": ("taint-reachable", "reachable"),
+            "not_confirmed": ("taint-not-confirmed", "not confirmed"),
+            "no_enclosing_method": ("taint-no-method", "no method"),
+            "no_entry_points": ("taint-no-method", "no entries"),
+            "skipped": ("taint-skipped", "skipped"),
+        }.get(status, ("taint-skipped", status))
 
     def _format_code_snippet(self, snippet: str, line_start: int = None, line_end: int = None) -> str:
         """Format code snippet with syntax highlighting."""

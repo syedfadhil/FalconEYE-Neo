@@ -91,6 +91,12 @@ class ConsoleFormatter(OutputFormatter):
         # Confidence
         confidence_str = self._format_confidence(finding.confidence)
         lines.append(f"Confidence: {confidence_str}")
+
+        # Reachability (taint-confirmation) block, when present
+        reach_lines = self._format_taint_confirmation(finding)
+        if reach_lines:
+            lines.extend(reach_lines)
+
         lines.append("")
 
         # Reasoning block
@@ -166,6 +172,59 @@ class ConsoleFormatter(OutputFormatter):
         lines.append("Analysis powered by AI (ZERO pattern matching)")
         lines.append(self._bold("=" * 70))
         return "\n".join(lines)
+
+    def _format_taint_confirmation(self, finding: SecurityFinding) -> "list[str]":
+        """Format the ``taint_confirmation`` block for this finding.
+
+        Returns a list of lines to append to the finding output, or an
+        empty list when confirmation was not run (older findings, or
+        --confirm-taint wasn't used). Each status gets a color:
+          confirmed_reachable -> green (highest structural signal)
+          not_confirmed       -> yellow (ambiguous; keep for review)
+          no_enclosing_method -> yellow (parse gap; keep for review)
+          no_entry_points     -> gray (workspace-level condition)
+          skipped             -> gray (language not supported)
+
+        Falls back to plain text when ``use_color`` is False.
+        """
+        conf = getattr(finding, "taint_confirmation", None)
+        if conf is None:
+            return []
+
+        status = conf.status
+        color = self._taint_status_color(status)
+        label = self._colorize(status, color)
+        lines: "list[str]" = [f"Reachability: {label}"]
+
+        if status == "confirmed_reachable":
+            hops = conf.hop_count if conf.hop_count is not None else 0
+            hop_word = "hop" if hops == 1 else "hops"
+            n_entries = len(conf.reachable_entry_points)
+            entry_word = "entry point" if n_entries == 1 else "entry points"
+            lines.append(f"  Reachable from {n_entries} {entry_word}, {hops} {hop_word}")
+            if conf.shortest_chain:
+                # Show the chain compactly using the last name segment
+                # of each canonical name -- full names get long fast.
+                short_chain = [
+                    n.rsplit(".", 1)[-1] if "." in n else n
+                    for n in conf.shortest_chain
+                ]
+                lines.append(f"  Chain: {" -> ".join(short_chain)}")
+        elif conf.reason and status in ("not_confirmed", "no_enclosing_method"):
+            # For non-reachable statuses, surface the reason so the
+            # operator can distinguish "helper method / dead code" from
+            # "top-level statement / parse issue" at a glance.
+            wrapped = self._wrap_text(conf.reason, prefix="  ")
+            lines.extend(wrapped.split("\n"))
+        return lines
+
+    def _taint_status_color(self, status: str) -> str:
+        """Map a taint-confirmation status to a console color name."""
+        if status == "confirmed_reachable":
+            return "green"
+        if status in ("not_confirmed", "no_enclosing_method", "no_entry_points"):
+            return "yellow"
+        return "gray"
 
     def _format_severity(self, severity: Severity) -> str:
         """Format severity with color and icon."""
