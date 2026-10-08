@@ -17,7 +17,11 @@ from .commands import (
 )
 from .commands_upgrade import upgrade_command
 from .commands_taint import taint_command
-from .commands_skill import skill_list_command, skill_run_command
+from .commands_skill import (
+    skill_list_command,
+    skill_run_all_command,
+    skill_run_command,
+)
 from .commands_taint_confirm import taint_confirm_command
 from .commands_projects import (
     projects_list_command,
@@ -803,6 +807,76 @@ def skill_run(
         output_file=output_file,
         config_path=config,
         skills_dir_override=skills_dir,
+        console=console,
+    )
+
+
+
+@skill_app.command(name="run-all")
+def skill_run_all(
+    workspace: Path = typer.Argument(
+        ...,
+        help="Path to the codebase to audit",
+        exists=True,
+    ),
+    output_format: str = typer.Option(
+        "console",
+        "--output", "-o",
+        help="Output format: console or json",
+    ),
+    output_file: Optional[Path] = typer.Option(
+        None,
+        "--output-file",
+        help="Write JSON output to this file (requires --output json)",
+    ),
+    dedupe: bool = typer.Option(
+        True,
+        "--dedupe/--no-dedupe",
+        help=(
+            "Collapse findings sharing (file, line, category). "
+            "When multiple skills flag the same site, the highest-severity finding survives with tags merged from the dropped duplicates. Disable with --no-dedupe to see raw per-skill output."
+        ),
+    ),
+    skills_dir: Optional[Path] = typer.Option(
+        None,
+        "--skills-dir",
+        help="Override the skills directory (bypasses config gating)",
+        exists=False,
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config", "-c",
+        help="Path to config file",
+        exists=True,
+    ),
+):
+    """
+    Execute every runnable skill against a workspace.
+
+    Loads every skill from the configured directory, filters to
+    those with function=scan and at least one Step 1 discovery
+    pattern, runs each in sequence, and aggregates all findings
+    into a single SecurityReview. Skipped and errored skills are
+    surfaced in the batch summary so operators can see why they
+    didn\'t contribute.
+
+    When --dedupe is on (default), findings sharing (file, line,
+    category) are collapsed to the highest-severity survivor. The
+    survivor accumulates the skill:<name> tags of dropped
+    duplicates so cross-skill provenance is visible.
+
+    Usage:
+        falconeye skill run-all Portal
+        falconeye skill run-all Portal --output json --output-file all.json
+        falconeye skill run-all Portal --no-dedupe
+    """
+    skill_run_all_command(
+        workspace=workspace,
+        output_format=output_format,
+        output_file=output_file,
+        config_path=config,
+        skills_dir_override=skills_dir,
+        dedupe=dedupe,
         console=console,
     )
 

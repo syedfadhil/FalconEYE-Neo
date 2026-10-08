@@ -321,3 +321,168 @@ def _write_findings_json(review, output_file, console: Console) -> None:
         console.print(
             f"[green]Wrote {len(review.findings)} findings to[/green] {output_file}"
         )
+
+
+
+def skill_run_all_command(
+    *,
+    workspace: Path,
+    output_format: str,
+    output_file: Optional[Path],
+    config_path: Optional[Path],
+    skills_dir_override: Optional[Path],
+    dedupe: bool,
+    console: Console,
+) -> None:
+    """Execute every runnable skill against a workspace.
+
+    Loads all skills from the configured skills directory (respects
+    ``--skills-dir``), filters out non-runnable ones (function=verify /
+    triage, or missing Step 1 discovery patterns), invokes each
+    remaining skill via ``SkillRunnerService.run_all``, aggregates the
+    findings into a single ``SecurityReview``, and optionally
+    deduplicates.
+
+    Skipped skills are surfaced in the summary with the reason so the
+    operator can see why (and fix the skill file if the skip was
+    unintentional).
+    """
+    import asyncio
+    import json as _json
+    import sys as _sys
+
+    from ...application.services.skill_runner_service import (
+        BATCH_STATUS_ERROR,
+        BATCH_STATUS_RAN,
+        BATCH_STATUS_SKIPPED_NO_PATTERNS,
+        BATCH_STATUS_SKIPPED_NOT_SCAN,
+        SkillRunnerService,
+    )
+    from ...infrastructure.skills.skill_loader import SkillLoader
+
+    # Resolve skill loader (config gating vs. override)
+    if skills_dir_override is not None:
+        skill_loader = SkillLoader(directory=skills_dir_override.expanduser())
+    else:
+        container = DIContainer.create(
+            config_path=str(config_path) if config_path else None,
+        )
+        if container.skill_loader is None:
+            console.print("[red]Skills are not enabled in the config.[/red]")
+            console.print(
+                "Set [bold]config.skills.enabled: true[/bold] and configure "
+                "[bold]config.skills.directory[/bold], set the "
+                "[bold]FALCONEYE_SKILLS_DIR[/bold] environment variable, or "
+                "pass [bold]--skills-dir[/bold] on this command."
+            )
+            _sys.exit(2)
+        skill_loader = container.skill_loader
+
+    all_skills = skill_loader.load_all()
+    if not all_skills:
+        console.print(
+            f"[yellow]No skills found in[/yellow] {skill_loader.directory}"
+        )
+        console.print("Nothing to run.")
+        return
+
+    if not workspace.exists():
+        console.print(f"[red]Workspace path does not exist:[/red] {workspace}")
+        _sys.exit(2)
+
+    # Get the LLM service
+    container = DIContainer.create(
+        config_path=str(config_path) if config_path else None,
+    )
+    llm_service = getattr(container, "llm_service", None)
+    if llm_service is None:
+        console.print(
+            "[red]No LLM service configured.[/red] Check the "
+            "[bold]llm[/bold] section of your config."
+        )
+        _sys.exit(2)
+
+    # Preview: what will run, what will skip
+    runnable = [s for s in all_skills if s.is_runnable_today and s.discovery_patterns]
+    skipped_preview = len(all_skills) - len(runnable)
+    console.print(
+        f"[cyan]Running {len(runnable)} of {len(all_skills)} skills[/cyan] "
+        f"against [cyan]{workspace}[/cyan]"
+        + (f"  [dim]({skipped_preview} skipped)[/dim]" if skipped_preview else "")
+    )
+
+    runner = SkillRunnerService(llm_service=llm_service)
+    review, batch = asyncio.run(
+        runner.run_all(skills=all_skills, workspace=workspace, dedupe=dedupe)
+    )
+
+    # Per-skill summary table
+    _print_batch_summary(console, batch, dedupe=dedupe)
+
+    # Findings output
+    if output_format == "json":
+        _write_findings_json(review, output_file, console)
+    else:
+        _print_findings_console(console, review)
+
+
+def _print_batch_summary(console: Console, batch, *, dedupe: bool) -> None:
+    """One-line-per-skill table plus totals.
+
+    Skills that ran show findings count and error count. Skipped
+    skills show the reason so operators know why (bad function tag,
+    missing Step 1 patterns, etc.). Errored skills show the exception.
+    """
+    from ...application.services.skill_runner_service import (
+        BATCH_STATUS_ERROR,
+        BATCH_STATUS_RAN,
+        BATCH_STATUS_SKIPPED_NO_PATTERNS,
+        BATCH_STATUS_SKIPPED_NOT_SCAN,
+    )
+
+    console.print(f"\n[bold]Batch summary[/bold]")
+    for o in batch.outcomes:
+        if o.status == BATCH_STATUS_RAN and o.summary is not None:
+            n = o.summary.total_findings
+            errs = o.summary.files_with_llm_errors
+            err_str = f"  [red]{errs} error{'s' if errs != 1 else ''}[/red]" if errs else ""
+            console.print(
+                f"  [green]RAN[/green]      "
+                f"[bold]{o.skill_name}[/bold]: "
+                f"{n} finding{'s' if n != 1 else ''}"
+                f"{err_str}"
+            )
+        elif o.status == BATCH_STATUS_SKIPPED_NOT_SCAN:
+            console.print(
+                f"  [yellow]SKIPPED[/yellow]  "
+                f"[bold]{o.skill_name}[/bold]: [dim]{o.reason}[/dim]"
+            )
+        elif o.status == BATCH_STATUS_SKIPPED_NO_PATTERNS:
+            console.print(
+                f"  [yellow]SKIPPED[/yellow]  "
+                f"[bold]{o.skill_name}[/bold]: [dim]{o.reason}[/dim]"
+            )
+        elif o.status == BATCH_STATUS_ERROR:
+            console.print(
+                f"  [red]ERROR[/red]    "
+                f"[bold]{o.skill_name}[/bold]: {o.reason}"
+            )
+
+    # Totals line
+    totals_parts = [
+        f"[bold]{batch.skills_ran}[/bold] ran",
+        f"[bold]{batch.skills_skipped}[/bold] skipped",
+    ]
+    if batch.skills_errored:
+        totals_parts.append(f"[red]{batch.skills_errored}[/red] errored")
+    findings_str = f"[bold]{batch.findings_kept}[/bold] findings"
+    if dedupe and batch.duplicates_dropped:
+        findings_str += (
+            f" [dim](deduped from {batch.total_findings}; "
+            f"{batch.duplicates_dropped} duplicate"
+            f"{'s' if batch.duplicates_dropped != 1 else ''} dropped)[/dim]"
+        )
+    console.print(
+        f"[dim]Total:[/dim] {', '.join(totals_parts)}, {findings_str}"
+    )
+    console.print()

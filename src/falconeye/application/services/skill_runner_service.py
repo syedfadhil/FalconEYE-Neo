@@ -90,6 +90,54 @@ class SkillRunSummary:
 
 
 # --------------------------------------------------------------------
+# Batch-run aggregation models
+# --------------------------------------------------------------------
+
+
+#: Batch outcome status constants. Kept as strings (not an Enum) so
+#: they serialize cleanly to JSON and templates without extra work.
+BATCH_STATUS_RAN = "ran"
+BATCH_STATUS_SKIPPED_NOT_SCAN = "skipped_not_scan"
+BATCH_STATUS_SKIPPED_NO_PATTERNS = "skipped_no_patterns"
+BATCH_STATUS_ERROR = "error"
+
+
+@dataclass(frozen=True)
+class SkillBatchOutcome:
+    """Per-skill result in a ``run_all`` batch.
+
+    Populated for every skill in the batch regardless of whether it
+    executed. ``status`` distinguishes the four cases; the CLI uses
+    it to color-code the summary and print skip reasons.
+
+    ``summary`` is populated only when the skill actually ran (status
+    == BATCH_STATUS_RAN). For skipped or errored skills it is None.
+    """
+    skill_name: str
+    status: str
+    reason: str = ""
+    summary: "Optional[SkillRunSummary]" = None
+
+
+@dataclass
+class SkillBatchSummary:
+    """Aggregate counts across a batch run.
+
+    ``total_findings`` counts pre-deduplication; ``findings_kept`` is
+    the count after dedup (may equal total_findings when dedup is off
+    or when no duplicates were found).
+    """
+    total_skills_seen: int = 0
+    skills_ran: int = 0
+    skills_skipped: int = 0
+    skills_errored: int = 0
+    total_findings: int = 0
+    findings_kept: int = 0
+    duplicates_dropped: int = 0
+    outcomes: List[SkillBatchOutcome] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------
 # Prompt construction
 # --------------------------------------------------------------------
 
@@ -469,6 +517,108 @@ class SkillRunnerService:
         review.complete()
         return review, summary
 
+    async def run_all(
+        self,
+        *,
+        skills: "List[SkillDefinition]",
+        workspace: Path,
+        dedupe: bool = True,
+    ) -> "tuple[SecurityReview, SkillBatchSummary]":
+        """Run every runnable skill in ``skills`` against ``workspace``.
+
+        Skills that aren't runnable (function != scan, or no Step 1
+        discovery patterns) are recorded in the batch summary as
+        skipped rather than failing the whole batch. Skills that
+        raise unexpectedly during execution are recorded as errored.
+        Both cases keep the batch flowing so a broken skill doesn't
+        block the operator from seeing what everything else found.
+
+        Findings from every skill land in ONE :class:`SecurityReview`
+        with the per-skill ``skill:<name>`` tag from the single-skill
+        runner preserved. When ``dedupe`` is True, findings with the
+        same (normalized_file_path, line_start, category) are
+        collapsed: the highest-severity survivor wins, tiebreaking
+        first by highest confidence and second by first-seen order.
+        This handles overlaps between related skills (e.g. injection-
+        prevention and input-validation both flagging the same call
+        site) without dropping information -- the survivor accumulates
+        the dropped tags so provenance is visible in the report.
+        """
+        review = SecurityReview.create(
+            codebase_path=str(workspace),
+            language="multi",  # batch spans multiple skill categories
+        )
+        batch = SkillBatchSummary(total_skills_seen=len(skills))
+
+        for skill in skills:
+            # Skip non-scan skills up front with a clear status
+            if not skill.is_runnable_today:
+                batch.outcomes.append(SkillBatchOutcome(
+                    skill_name=skill.name,
+                    status=BATCH_STATUS_SKIPPED_NOT_SCAN,
+                    reason=(
+                        f"function={skill.metadata.function or 'unknown'} is "
+                        "not executable via run_all; routes to fp-check "
+                        "(Phase 3) or triage (Phase 4)."
+                    ),
+                ))
+                batch.skills_skipped += 1
+                continue
+
+            if not skill.discovery_patterns:
+                batch.outcomes.append(SkillBatchOutcome(
+                    skill_name=skill.name,
+                    status=BATCH_STATUS_SKIPPED_NO_PATTERNS,
+                    reason=(
+                        "no Step 1 discovery patterns; whole-workspace "
+                        "LLM-only execution is Phase 1c work."
+                    ),
+                ))
+                batch.skills_skipped += 1
+                continue
+
+            try:
+                sub_review, sub_summary = await self.run(
+                    skill=skill, workspace=workspace,
+                )
+            except Exception as e:
+                _logger.warning(
+                    "Skill %s raised during batch run: %s", skill.name, e,
+                )
+                batch.outcomes.append(SkillBatchOutcome(
+                    skill_name=skill.name,
+                    status=BATCH_STATUS_ERROR,
+                    reason=f"{type(e).__name__}: {e}",
+                ))
+                batch.skills_errored += 1
+                continue
+
+            batch.outcomes.append(SkillBatchOutcome(
+                skill_name=skill.name,
+                status=BATCH_STATUS_RAN,
+                summary=sub_summary,
+            ))
+            batch.skills_ran += 1
+            for f in sub_review.findings:
+                review.add_finding(f)
+
+        # Deduplicate findings if requested. Aggregate first so we
+        # accumulate ALL findings; then collapse duplicates. The
+        # non-dedupe path just tallies and moves on.
+        batch.total_findings = len(review.findings)
+        if dedupe and review.findings:
+            deduped, dropped = _dedupe_findings(review.findings)
+            # Reassign in-place so any reference to review.findings
+            # stays valid (matches the pattern used by
+            # ReviewConfirmationService).
+            review.findings.clear()
+            review.findings.extend(deduped)
+            batch.duplicates_dropped = dropped
+        batch.findings_kept = len(review.findings)
+
+        review.complete()
+        return review, batch
+
     # ---- internals ----
 
     async def _evaluate_file(
@@ -544,3 +694,125 @@ class SkillRunnerService:
             discovery_hit_count=len(hits),
             findings_emitted=emitted,
         )
+
+
+
+# --------------------------------------------------------------------
+# Deduplication (batch runs)
+# --------------------------------------------------------------------
+
+
+#: Severity ordering, high-to-low. Used to pick the survivor when
+#: multiple findings hit the same (file, line, category) key.
+_SEVERITY_RANK = {
+    Severity.CRITICAL: 4,
+    Severity.HIGH: 3,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 1,
+}
+
+_CONFIDENCE_RANK = {
+    FindingConfidence.HIGH: 3,
+    FindingConfidence.MEDIUM: 2,
+    FindingConfidence.LOW: 1,
+}
+
+
+def _dedupe_findings(findings):
+    """Collapse findings sharing (normalized_file, line, category).
+
+    Returns (kept, dropped_count). The kept list preserves the
+    original order of first-seen survivors so operators reading the
+    report in top-to-bottom order see findings in a stable sequence
+    across runs.
+
+    Survivor selection:
+      1. Highest severity wins.
+      2. Ties broken by highest confidence.
+      3. Further ties broken by first-seen order.
+
+    The survivor accumulates the ``skill:<name>`` tags of every
+    dropped duplicate so provenance is visible (an operator can see
+    that both injection-prevention AND input-validation flagged the
+    same site).
+    """
+    # Group by key preserving first-seen order.
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for f in findings:
+        key = _dedupe_key(f)
+        groups.setdefault(key, []).append(f)
+
+    kept = []
+    dropped = 0
+    for key, group in groups.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+        # Pick survivor
+        survivor = _pick_survivor(group)
+        # Merge tags from dropped
+        merged_tags = list(survivor.tags)
+        for other in group:
+            if other is survivor:
+                continue
+            for t in other.tags:
+                if t not in merged_tags:
+                    merged_tags.append(t)
+        # Reconstruct survivor with merged tags (frozen dataclass ->
+        # dataclasses.replace)
+        import dataclasses as _dc
+        survivor = _dc.replace(survivor, tags=merged_tags)
+        kept.append(survivor)
+        dropped += len(group) - 1
+    return kept, dropped
+
+
+def _dedupe_key(finding):
+    """(normalized_file_path, line_start, category) key for grouping.
+
+    Category is extracted from the ``category:<name>`` tag that the
+    per-skill runner attaches. Falls back to "unknown" so a finding
+    without an explicit category still participates in dedup (against
+    other uncategorized findings on the same line).
+    """
+    file_key = _normalize_path_for_dedup(finding.file_path or "")
+    line_key = finding.line_start or 0
+    category = "unknown"
+    for tag in finding.tags:
+        if tag.startswith("category:"):
+            category = tag[len("category:"):]
+            break
+    return (file_key, line_key, category)
+
+
+def _normalize_path_for_dedup(p: str) -> str:
+    """Normalize path for cross-OS deduplication comparison.
+
+    Replaces backslashes, drops drive letters, lowercases. Same
+    strategy as the reachability confirmer to keep behavior
+    consistent across the confirmation and dedup passes.
+    """
+    import os as _os
+    p = p.replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        p = p[2:]
+    return _os.path.normpath(p.lower())
+
+
+def _pick_survivor(group):
+    """Return the highest-severity + highest-confidence finding.
+
+    Preserves first-seen order for ties by relying on stable sort.
+    """
+    def sort_key(idx_finding):
+        idx, f = idx_finding
+        # Negative ranks so ``min`` picks the highest.
+        return (
+            -_SEVERITY_RANK.get(f.severity, 0),
+            -_CONFIDENCE_RANK.get(f.confidence, 0),
+            idx,  # tiebreak: first-seen
+        )
+    indexed = list(enumerate(group))
+    indexed.sort(key=sort_key)
+    return indexed[0][1]

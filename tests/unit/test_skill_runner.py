@@ -494,3 +494,436 @@ def test_run_completes_review_at_end(tmp_path):
     runner = SkillRunnerService(llm_service=llm)
     review, _ = asyncio.run(runner.run(skill=skill, workspace=ws))
     assert review.completed_at is not None
+
+
+
+# =====================================================================
+# run_all: batch execution
+# =====================================================================
+
+
+from falconeye.application.services.skill_runner_service import (  # noqa: E402
+    BATCH_STATUS_ERROR,
+    BATCH_STATUS_RAN,
+    BATCH_STATUS_SKIPPED_NO_PATTERNS,
+    BATCH_STATUS_SKIPPED_NOT_SCAN,
+    SkillBatchOutcome,
+    SkillBatchSummary,
+    _dedupe_findings,
+    _dedupe_key,
+    _normalize_path_for_dedup,
+    _pick_survivor,
+)
+from falconeye.domain.models.security import SecurityFinding
+from uuid import uuid4
+
+
+def _write_named_scan_skill(root: Path, name: str, category: str = "test") -> Path:
+    d = root / name
+    d.mkdir()
+    (d / "SKILL.md").write_text(textwrap.dedent(f"""\
+    ---
+    name: {name}
+    description: test
+    function: scan
+    category: {category}
+    ---
+    ## Step 1
+    ```bash
+    grep -rn -E "dangerous_call" --include="*.py" .
+    ```
+    """), encoding="utf-8")
+    return d / "SKILL.md"
+
+
+def _write_verify_skill(root: Path, name: str) -> Path:
+    d = root / name; d.mkdir()
+    (d / "SKILL.md").write_text(textwrap.dedent(f"""\
+    ---
+    name: {name}
+    description: verifier
+    function: verify
+    ---
+    ## Step 1
+    ```bash
+    grep -rn -E "x" --include="*.py" .
+    ```
+    """), encoding="utf-8")
+    return d / "SKILL.md"
+
+
+def _write_llm_only_skill(root: Path, name: str) -> Path:
+    d = root / name; d.mkdir()
+    (d / "SKILL.md").write_text(textwrap.dedent(f"""\
+    ---
+    name: {name}
+    description: llm only
+    function: scan
+    ---
+    ## Step 1
+
+    Read every file.
+    """), encoding="utf-8")
+    return d / "SKILL.md"
+
+
+def _minimal_finding_response(issue: str, severity: str = "High",
+                              category: str = "injection",
+                              line: int = 2) -> str:
+    """Build a minimal ``{"findings": [...]}`` LLM response string."""
+    return json.dumps({"findings": [{
+        "issue": issue, "severity": severity, "confidence": "High",
+        "file": "vuln.py", "line": line,
+        "description": "x", "recommended_fix": "y",
+        "cwe": None, "category": category,
+    }]})
+
+
+@pytest.mark.unit
+def test_run_all_runs_every_runnable_skill(tmp_path):
+    """Two runnable skills: both execute and both contribute findings."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "s1", category="a")
+    _write_named_scan_skill(skills_dir, "s2", category="b")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("def x():\n    dangerous_call()\n")
+
+    skills = SkillLoader(directory=skills_dir).load_all()
+    assert len(skills) == 2
+
+    llm = MockLLM([
+        _minimal_finding_response("issue-a", category="a"),
+        _minimal_finding_response("issue-b", category="b"),
+    ])
+    runner = SkillRunnerService(llm_service=llm)
+    review, batch = asyncio.run(runner.run_all(
+        skills=skills, workspace=ws, dedupe=False,
+    ))
+
+    assert batch.total_skills_seen == 2
+    assert batch.skills_ran == 2
+    assert batch.skills_skipped == 0
+    assert batch.skills_errored == 0
+    assert len(review.findings) == 2
+    issues = sorted(f.issue for f in review.findings)
+    assert issues == ["issue-a", "issue-b"]
+
+
+@pytest.mark.unit
+def test_run_all_skips_non_scan_skills(tmp_path):
+    """function=verify -> BATCH_STATUS_SKIPPED_NOT_SCAN."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "runnable")
+    _write_verify_skill(skills_dir, "vfy")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("dangerous_call()\n")
+
+    skills = SkillLoader(directory=skills_dir).load_all()
+    llm = MockLLM([_minimal_finding_response("found")])
+    runner = SkillRunnerService(llm_service=llm)
+    _, batch = asyncio.run(runner.run_all(skills=skills, workspace=ws))
+
+    assert batch.skills_ran == 1
+    assert batch.skills_skipped == 1
+    vfy_outcome = next(o for o in batch.outcomes if o.skill_name == "vfy")
+    assert vfy_outcome.status == BATCH_STATUS_SKIPPED_NOT_SCAN
+    assert "function=verify" in vfy_outcome.reason
+
+
+@pytest.mark.unit
+def test_run_all_skips_llm_only_skills(tmp_path):
+    """No Step 1 grep patterns -> BATCH_STATUS_SKIPPED_NO_PATTERNS."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "with-patterns")
+    _write_llm_only_skill(skills_dir, "no-patterns")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("dangerous_call()\n")
+
+    skills = SkillLoader(directory=skills_dir).load_all()
+    llm = MockLLM([_minimal_finding_response("found")])
+    runner = SkillRunnerService(llm_service=llm)
+    _, batch = asyncio.run(runner.run_all(skills=skills, workspace=ws))
+
+    assert batch.skills_ran == 1
+    assert batch.skills_skipped == 1
+    no_pat = next(o for o in batch.outcomes if o.skill_name == "no-patterns")
+    assert no_pat.status == BATCH_STATUS_SKIPPED_NO_PATTERNS
+    assert "no Step 1 discovery patterns" in no_pat.reason
+
+
+@pytest.mark.unit
+def test_run_all_isolates_skill_errors(tmp_path):
+    """A skill whose run() raises is marked errored but the batch continues."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "broken", category="a")
+    _write_named_scan_skill(skills_dir, "healthy", category="b")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("dangerous_call()\n")
+
+    skills = SkillLoader(directory=skills_dir).load_all()
+
+    # Both skills invoke the LLM once. Make the FIRST call raise via
+    # a callable in the response queue; the second returns a normal
+    # response. The `broken` skill is loaded first alphabetically,
+    # so it hits the raising call.
+    def raise_call(system, user):
+        raise RuntimeError("simulated outage")
+    llm = MockLLM([raise_call, _minimal_finding_response("from healthy")])
+
+    runner = SkillRunnerService(llm_service=llm)
+    review, batch = asyncio.run(runner.run_all(skills=skills, workspace=ws))
+
+    # broken skill's run() succeeded (the LLM error was caught per-file
+    # inside run()); the skill produced ZERO findings but did NOT raise.
+    # So both skills show BATCH_STATUS_RAN; the broken skill's
+    # per-file summary carries files_with_llm_errors == 1.
+    broken = next(o for o in batch.outcomes if o.skill_name == "broken")
+    healthy = next(o for o in batch.outcomes if o.skill_name == "healthy")
+    assert broken.status == BATCH_STATUS_RAN
+    assert broken.summary is not None
+    assert broken.summary.files_with_llm_errors == 1
+    assert broken.summary.total_findings == 0
+    assert healthy.status == BATCH_STATUS_RAN
+    assert healthy.summary.total_findings == 1
+
+    # Healthy findings still land in the review
+    assert len(review.findings) == 1
+    assert review.findings[0].issue == "from healthy"
+
+
+@pytest.mark.unit
+def test_run_all_dedupe_collapses_same_key(tmp_path):
+    """Two skills flagging (file=vuln.py, line=2, category=injection) -> 1."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "s1", category="injection")
+    _write_named_scan_skill(skills_dir, "s2", category="injection")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("dangerous_call()\n")
+
+    skills = SkillLoader(directory=skills_dir).load_all()
+    llm = MockLLM([
+        _minimal_finding_response("dup", severity="High", category="injection"),
+        _minimal_finding_response("dup", severity="Medium", category="injection"),
+    ])
+    runner = SkillRunnerService(llm_service=llm)
+    review, batch = asyncio.run(runner.run_all(
+        skills=skills, workspace=ws, dedupe=True,
+    ))
+
+    assert batch.total_findings == 2
+    assert batch.findings_kept == 1
+    assert batch.duplicates_dropped == 1
+    # Survivor is the High-severity one
+    assert review.findings[0].severity == Severity.HIGH
+
+
+@pytest.mark.unit
+def test_run_all_dedupe_survivor_accumulates_skill_tags(tmp_path):
+    """When two skills flag the same site, the survivor's tags
+    show BOTH skill provenance so the operator sees who found what."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "aaa", category="injection")
+    _write_named_scan_skill(skills_dir, "bbb", category="injection")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("dangerous_call()\n")
+
+    skills = SkillLoader(directory=skills_dir).load_all()
+    llm = MockLLM([
+        _minimal_finding_response("shared"),
+        _minimal_finding_response("shared"),
+    ])
+    runner = SkillRunnerService(llm_service=llm)
+    review, batch = asyncio.run(runner.run_all(
+        skills=skills, workspace=ws, dedupe=True,
+    ))
+    assert len(review.findings) == 1
+    tags = review.findings[0].tags
+    assert "skill:aaa" in tags
+    assert "skill:bbb" in tags
+
+
+@pytest.mark.unit
+def test_run_all_no_dedupe_keeps_all_findings(tmp_path):
+    """--no-dedupe path: every skill's findings preserved separately."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "s1", category="injection")
+    _write_named_scan_skill(skills_dir, "s2", category="injection")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("dangerous_call()\n")
+    skills = SkillLoader(directory=skills_dir).load_all()
+    llm = MockLLM([
+        _minimal_finding_response("dup"),
+        _minimal_finding_response("dup"),
+    ])
+    runner = SkillRunnerService(llm_service=llm)
+    review, batch = asyncio.run(runner.run_all(
+        skills=skills, workspace=ws, dedupe=False,
+    ))
+    assert len(review.findings) == 2
+    assert batch.total_findings == 2
+    assert batch.findings_kept == 2
+    assert batch.duplicates_dropped == 0
+
+
+@pytest.mark.unit
+def test_run_all_different_categories_are_not_deduped(tmp_path):
+    """(file, line, category) tuple keeps two DIFFERENT categories separate."""
+    skills_dir = tmp_path / "skills"; skills_dir.mkdir()
+    _write_named_scan_skill(skills_dir, "s1", category="injection")
+    _write_named_scan_skill(skills_dir, "s2", category="path-traversal")
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / "vuln.py").write_text("dangerous_call()\n")
+    skills = SkillLoader(directory=skills_dir).load_all()
+    llm = MockLLM([
+        _minimal_finding_response("a", category="injection"),
+        _minimal_finding_response("b", category="path-traversal"),
+    ])
+    runner = SkillRunnerService(llm_service=llm)
+    review, batch = asyncio.run(runner.run_all(
+        skills=skills, workspace=ws, dedupe=True,
+    ))
+    assert len(review.findings) == 2
+    assert batch.duplicates_dropped == 0
+
+
+@pytest.mark.unit
+def test_run_all_empty_skill_list_produces_empty_review(tmp_path):
+    """No skills at all -> empty review, empty batch, no crash."""
+    ws = tmp_path / "ws"; ws.mkdir()
+    runner = SkillRunnerService(llm_service=MockLLM([]))
+    review, batch = asyncio.run(runner.run_all(
+        skills=[], workspace=ws, dedupe=True,
+    ))
+    assert len(review.findings) == 0
+    assert batch.total_skills_seen == 0
+    assert batch.skills_ran == 0
+
+
+# ---------------------------------------------------------------
+# _dedupe_findings helper
+# ---------------------------------------------------------------
+
+
+def _finding(*, file_path="/x.py", line=1, severity=Severity.HIGH,
+             confidence=FindingConfidence.HIGH, issue="i",
+             category="injection", extra_tags=()) -> SecurityFinding:
+    tags = [f"category:{category}", *extra_tags]
+    return SecurityFinding(
+        id=uuid4(), issue=issue, reasoning="", mitigation="",
+        severity=severity, confidence=confidence,
+        file_path=file_path, code_snippet="",
+        line_start=line, line_end=None,
+        tags=tags,
+    )
+
+
+@pytest.mark.unit
+def test_dedupe_key_uses_normalized_path():
+    """C:\\proj\\file.py and /proj/file.py hash to the same dedup key
+    if their normalized forms match."""
+    f_win = _finding(file_path="C:\\proj\\file.py", line=5, category="c")
+    f_nix = _finding(file_path="/proj/file.py", line=5, category="c")
+    assert _dedupe_key(f_win) == _dedupe_key(f_nix)
+
+
+@pytest.mark.unit
+def test_dedupe_key_falls_back_to_unknown_category():
+    """A finding without a category tag participates in dedup as
+    category=unknown -- still groups with other uncategorized findings."""
+    f = SecurityFinding(
+        id=uuid4(), issue="i", reasoning="", mitigation="",
+        severity=Severity.LOW, confidence=FindingConfidence.LOW,
+        file_path="/x", code_snippet="", line_start=1, line_end=None,
+        tags=[],  # no category tag
+    )
+    key = _dedupe_key(f)
+    assert key[2] == "unknown"
+
+
+@pytest.mark.unit
+def test_dedupe_picks_highest_severity_survivor():
+    findings = [
+        _finding(severity=Severity.LOW, issue="low"),
+        _finding(severity=Severity.CRITICAL, issue="crit"),
+        _finding(severity=Severity.MEDIUM, issue="med"),
+    ]
+    kept, dropped = _dedupe_findings(findings)
+    assert len(kept) == 1
+    assert kept[0].issue == "crit"
+    assert dropped == 2
+
+
+@pytest.mark.unit
+def test_dedupe_tiebreaks_severity_by_confidence():
+    """Same severity -> pick highest confidence."""
+    findings = [
+        _finding(severity=Severity.HIGH, confidence=FindingConfidence.LOW, issue="h-lo"),
+        _finding(severity=Severity.HIGH, confidence=FindingConfidence.HIGH, issue="h-hi"),
+        _finding(severity=Severity.HIGH, confidence=FindingConfidence.MEDIUM, issue="h-med"),
+    ]
+    kept, _ = _dedupe_findings(findings)
+    assert len(kept) == 1
+    assert kept[0].issue == "h-hi"
+
+
+@pytest.mark.unit
+def test_dedupe_tiebreak_severity_confidence_by_first_seen():
+    """Same severity AND confidence -> keep the first-seen."""
+    findings = [
+        _finding(issue="first"),
+        _finding(issue="second"),
+        _finding(issue="third"),
+    ]
+    kept, _ = _dedupe_findings(findings)
+    assert len(kept) == 1
+    assert kept[0].issue == "first"
+
+
+@pytest.mark.unit
+def test_dedupe_no_duplicates_preserves_order():
+    """Findings with distinct keys are all kept in first-seen order."""
+    findings = [
+        _finding(file_path="/a", issue="a"),
+        _finding(file_path="/b", issue="b"),
+        _finding(file_path="/c", issue="c"),
+    ]
+    kept, dropped = _dedupe_findings(findings)
+    assert [f.issue for f in kept] == ["a", "b", "c"]
+    assert dropped == 0
+
+
+@pytest.mark.unit
+def test_dedupe_survivor_accumulates_dropped_tags():
+    """Tags from dropped duplicates merge into the survivor's tags."""
+    findings = [
+        _finding(severity=Severity.CRITICAL, issue="win",
+                 extra_tags=("skill:aaa",)),
+        _finding(severity=Severity.MEDIUM, issue="lose1",
+                 extra_tags=("skill:bbb",)),
+        _finding(severity=Severity.LOW, issue="lose2",
+                 extra_tags=("skill:ccc", "custom:tag")),
+    ]
+    kept, _ = _dedupe_findings(findings)
+    tags = kept[0].tags
+    assert "skill:aaa" in tags
+    assert "skill:bbb" in tags
+    assert "skill:ccc" in tags
+    assert "custom:tag" in tags
+
+
+@pytest.mark.unit
+def test_dedupe_empty_input_returns_empty():
+    kept, dropped = _dedupe_findings([])
+    assert kept == []
+    assert dropped == 0
+
+
+@pytest.mark.unit
+def test_normalize_path_for_dedup_windows_and_posix_equal():
+    """Windows drive letter + backslashes normalize identically to
+    lowercase POSIX path -- so a finding produced on Windows and one
+    produced on Linux for the same logical file dedupe together."""
+    assert (
+        _normalize_path_for_dedup("C:\\Users\\Fadhil\\file.py")
+        == _normalize_path_for_dedup("/Users/Fadhil/file.py")
+    )
