@@ -446,6 +446,7 @@ def review_command(
     sage: bool = False,
     resume: Optional[bool] = None,
     concurrency: Optional[int] = None,
+    confirm_taint: bool = False,
     console: Console = None,
 ):
     """
@@ -467,6 +468,11 @@ def review_command(
                 None = auto-prompt on match, True = force resume, False = fresh scan
         concurrency: Max files analyzed in parallel. Defaults to
                      config.analysis.batch_size.
+        confirm_taint: When True, run call-graph reachability
+                       confirmation on findings before output.
+                       Enriches each finding with a taint_confirmation
+                       block. Requires taint to be enabled for at
+                       least one language in config.
         console: Rich console
     """
     if verbose:
@@ -1147,6 +1153,30 @@ def review_command(
                     console.print(f"\n{error_msg}")
                     raise SystemExit(1)
 
+    # Optionally run reachability confirmation on the findings.
+    # Enriches each finding's taint_confirmation field in place on
+    # a rebuilt review object; safe because SecurityReview.findings
+    # is a mutable list and dataclasses.replace produces new frozen
+    # findings. Skipped silently if the service isn't available
+    # (no taint-enabled language configured) so --confirm-taint on
+    # a project without taint config produces a clear warning
+    # instead of a hard error.
+    if confirm_taint and review.findings:
+        confirmation_service = getattr(container, "review_confirmation_service", None)
+        if confirmation_service is None:
+            console.print(
+                "[yellow]--confirm-taint requested but no taint-enabled "
+                "language is configured. Skipping confirmation.[/yellow]"
+            )
+        else:
+            _run_taint_confirmation(
+                review=review,
+                repo_path=path if path.is_dir() else path.parent,
+                confirmation_service=confirmation_service,
+                config=container.config,
+                console=console,
+            )
+
     # Format output
     formatter = FormatterFactory.create(
         output_format,
@@ -1493,3 +1523,67 @@ def config_command(
         console.print("\n[bold]Default Locations:[/bold]")
         for default_path in config_info["default_paths"]:
             console.print(f"  {default_path}")
+
+def _run_taint_confirmation(
+    *,
+    review,
+    repo_path: Path,
+    confirmation_service,
+    config,
+    console: Console,
+) -> None:
+    """Enrich a SecurityReview's findings with taint reachability.
+
+    Called from ``review_command`` when ``--confirm-taint`` is set.
+    Mutates ``review.findings`` in place with new SecurityFinding
+    instances that carry ``taint_confirmation`` populated.
+
+    Failures are non-fatal: any exception during confirmation is
+    logged to the console and the review proceeds without
+    enrichment. Rationale -- the review's primary output is the
+    findings themselves; confirmation is additive signal. A broken
+    call-graph build (e.g. tree-sitter crash on an odd source file)
+    shouldn't prevent the operator from seeing what the LLM found.
+    """
+    # Which taint-enabled languages are eligible for confirmation?
+    taint_languages = [
+        lang
+        for lang, settings in config.languages.per_language.items()
+        if settings.taint.enabled and lang in config.languages.enabled
+    ]
+    if not taint_languages:
+        console.print(
+            "[yellow]No taint-enabled languages in config; "
+            "skipping --confirm-taint.[/yellow]"
+        )
+        return
+
+    try:
+        confirmed, summary = confirmation_service.confirm(
+            findings=review.findings,
+            repo_path=repo_path,
+            languages=taint_languages,
+        )
+    except Exception as e:
+        console.print(
+            f"[yellow]Taint confirmation failed ({type(e).__name__}: {e}). "
+            "Continuing without confirmation enrichment.[/yellow]"
+        )
+        return
+
+    # Replace findings in place. SecurityReview.findings is a list;
+    # we clear and extend to keep any identity-based references to the
+    # review object valid.
+    review.findings.clear()
+    review.findings.extend(confirmed)
+
+    # One-line diagnostic so the operator can see the enrichment ran.
+    console.print(
+        f"[dim]Taint confirmation:[/dim] "
+        f"[green]{summary.reachable} reachable[/green], "
+        f"[yellow]{summary.not_confirmed} not_confirmed[/yellow], "
+        f"{summary.no_enclosing_method} no_method, "
+        f"{summary.skipped} skipped "
+        f"[dim]({summary.entry_points_detected} entry points, "
+        f"{summary.call_graph_nodes} nodes)[/dim]"
+    )

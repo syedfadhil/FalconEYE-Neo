@@ -197,6 +197,17 @@ def review(
         ),
         min=1,
     ),
+    confirm_taint: bool = typer.Option(
+        False,
+        "--confirm-taint",
+        help=(
+            "Run call-graph reachability confirmation on findings before output. "
+            "Enriches each finding with a taint_confirmation block indicating whether "
+            "its enclosing method is reachable from any detected entry point (e.g. "
+            "HTTP controllers, middleware). Requires taint to be enabled for at least "
+            "one language in config."
+        ),
+    ),
 ):
     """
     Review a file or directory for security vulnerabilities.
@@ -224,6 +235,7 @@ def review(
         sage=sage,
         resume=resume,
         concurrency=concurrency,
+        confirm_taint=confirm_taint,
         console=console,
     )
 
