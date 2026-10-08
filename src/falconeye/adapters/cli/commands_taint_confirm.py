@@ -173,31 +173,131 @@ def _load_findings(findings_file: Path) -> List[SecurityFinding]:
 def _finding_from_dict(d: dict) -> SecurityFinding:
     """Rebuild a SecurityFinding from its dict form.
 
-    Tolerates missing optional fields (older JSON files). Ignores an
-    incoming ``taint_confirmation`` -- confirmation will be re-run and
-    a new value attached.
+    Two JSON shapes are in the wild:
+
+    * The FLAT shape produced by ``SecurityFinding.to_dict()`` -- what
+      ``falconeye taint-confirm --output json`` emits, and what a
+      caller building findings dicts by hand would naturally write.
+      Fields are top-level: ``confidence``, ``file_path``,
+      ``line_start``, ``verifier_verdict``, etc.
+
+    * The WRAPPED shape produced by the JSON reporter used with
+      ``falconeye review --output json``. Confidence is wrapped in
+      ``{"value": ..., "level": ...}``; location is wrapped in
+      ``{"file_path": ..., "line_start": ..., "line_end": ...}``;
+      verifier fields are wrapped in ``{"verdict": ..., "reasoning":
+      ..., "counterargument": ...}``.
+
+    This loader accepts either shape, extracting fields from whichever
+    form the input uses. Missing optional fields default sanely so
+    older JSON files still load. An incoming ``taint_confirmation``
+    is dropped -- confirmation will be re-run and a fresh value
+    attached.
     """
+    confidence = _confidence_from_json(d.get("confidence"))
+    severity = _severity_from_json(d.get("severity"))
+    file_path, line_start, line_end = _location_from_json(d)
+    verifier_verdict, verifier_reasoning, verifier_counter = _verifier_from_json(d)
+
     return SecurityFinding(
-        id=UUID(d["id"]) if "id" in d and d["id"] else UUID(int=0),
+        id=UUID(d["id"]) if d.get("id") else UUID(int=0),
         issue=d.get("issue", ""),
         reasoning=d.get("reasoning", ""),
         mitigation=d.get("mitigation", ""),
-        severity=Severity(d.get("severity", "medium")),
-        confidence=FindingConfidence(d.get("confidence", "medium")),
-        file_path=d.get("file_path", ""),
+        severity=severity,
+        confidence=confidence,
+        file_path=file_path,
         code_snippet=d.get("code_snippet", ""),
-        line_start=d.get("line_start"),
-        line_end=d.get("line_end"),
+        line_start=line_start,
+        line_end=line_end,
         cwe_id=d.get("cwe_id"),
-        tags=list(d.get("tags", [])),
-        evidence_lines=list(d.get("evidence_lines", [])),
-        assumed_context=d.get("assumed_context", ""),
-        why_not_false_positive=d.get("why_not_false_positive", ""),
-        reasoning_trace=d.get("reasoning_trace", ""),
-        validation_warnings=list(d.get("validation_warnings", [])),
-        verifier_verdict=d.get("verifier_verdict"),
-        verifier_reasoning=d.get("verifier_reasoning", ""),
-        verifier_counterargument=d.get("verifier_counterargument", ""),
+        tags=list(d.get("tags", []) or []),
+        evidence_lines=list(d.get("evidence_lines", []) or []),
+        assumed_context=d.get("assumed_context", "") or "",
+        why_not_false_positive=d.get("why_not_false_positive", "") or "",
+        reasoning_trace=d.get("reasoning_trace", "") or "",
+        validation_warnings=list(d.get("validation_warnings", []) or []),
+        verifier_verdict=verifier_verdict,
+        verifier_reasoning=verifier_reasoning,
+        verifier_counterargument=verifier_counter,
+    )
+
+
+def _confidence_from_json(value) -> FindingConfidence:
+    """Accept either a bare string or a ``{"value": ...}`` dict.
+
+    The JSON reporter emits confidence as ``{"value": "high", "level":
+    "high"}``. Both keys hold the same information; ``value`` matches
+    the FindingConfidence enum value directly.
+    """
+    if value is None:
+        return FindingConfidence("medium")
+    if isinstance(value, str):
+        return FindingConfidence(value)
+    if isinstance(value, dict):
+        # Prefer "value" (enum value); fall back to "level" (enum name lowercased).
+        raw = value.get("value") or value.get("level") or "medium"
+        return FindingConfidence(raw)
+    # Fallback: try str() and see if it parses.
+    return FindingConfidence(str(value))
+
+
+def _severity_from_json(value) -> Severity:
+    """Accept either a bare string or a wrapped ``{"value": ...}`` dict.
+
+    The JSON reporter currently emits severity as a bare string, but
+    accept the wrapped shape for symmetry with confidence -- costs
+    nothing and future-proofs against a similar wrap being added.
+    """
+    if value is None:
+        return Severity("medium")
+    if isinstance(value, str):
+        return Severity(value)
+    if isinstance(value, dict):
+        raw = value.get("value") or value.get("level") or "medium"
+        return Severity(raw)
+    return Severity(str(value))
+
+
+def _location_from_json(d: dict):
+    """Return (file_path, line_start, line_end) from either shape.
+
+    The JSON reporter wraps location fields in a ``location`` object;
+    the flat shape has them at the top level. This routine prefers
+    the wrapped form when present (JSON reporter output is the more
+    common source in practice) and falls back to top-level fields.
+    """
+    loc = d.get("location")
+    if isinstance(loc, dict):
+        return (
+            loc.get("file_path", "") or "",
+            loc.get("line_start"),
+            loc.get("line_end"),
+        )
+    return (
+        d.get("file_path", "") or "",
+        d.get("line_start"),
+        d.get("line_end"),
+    )
+
+
+def _verifier_from_json(d: dict):
+    """Return (verdict, reasoning, counterargument) from either shape.
+
+    Flat: verifier_verdict / verifier_reasoning / verifier_counterargument
+    Wrapped: verifier.verdict / verifier.reasoning / verifier.counterargument
+    """
+    v = d.get("verifier")
+    if isinstance(v, dict):
+        return (
+            v.get("verdict"),
+            v.get("reasoning", "") or "",
+            v.get("counterargument", "") or "",
+        )
+    return (
+        d.get("verifier_verdict"),
+        d.get("verifier_reasoning", "") or "",
+        d.get("verifier_counterargument", "") or "",
     )
 
 
