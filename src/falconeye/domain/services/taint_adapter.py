@@ -28,7 +28,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List
 
-from ..models.taint import FunctionDef
+from ..models.taint import FunctionDef, UnresolvedCall
 
 
 class TaintLanguageAdapter(ABC):
@@ -69,6 +69,39 @@ class TaintLanguageAdapter(ABC):
             file_path: Path used for the ``Location.file_path`` field.
                 Not read from disk; passed through verbatim.
         """
+
+    def extract_calls(
+        self,
+        source: str,
+        file_path: str,
+    ) -> List[UnresolvedCall]:
+        """Every call site inside ``source``, with an unresolved callee.
+
+        Includes three syntactic forms, each distinguished by flags
+        on the returned :class:`UnresolvedCall`:
+
+          * ordinary invocations (``foo()``, ``obj.Bar()``,
+            ``Class.Static()``, ``Ns.Class.Static()``)
+          * constructor calls (``new TypeName(...)``) --
+            :attr:`~UnresolvedCall.is_constructor` is ``True``
+          * property setter assignments (``obj.Name = value``) --
+            :attr:`~UnresolvedCall.is_property_set` is ``True``
+
+        Every emitted call has a non-empty ``in_function`` field:
+        calls that appear outside any function body (top-level
+        statements, module initializers) are dropped because they
+        cannot participate in a call-graph edge.
+
+        The default implementation returns ``[]``. This lets an
+        early adapter (function extraction only) be a legitimate
+        contributor -- downstream code that queries calls just
+        finds none for that language until the adapter is extended.
+
+        Args:
+            source: Full source text of one file.
+            file_path: Path passed through to ``Location.file_path``.
+        """
+        return []
 
     @abstractmethod
     def detect_frameworks(self, project_root: Path) -> List[str]:

@@ -83,3 +83,21 @@ class UnresolvedCall:
     location: Location
     in_function: str
     positional_arg_count: int = 0
+
+    #: True when the syntactic form is ``new TypeName(...)``. The
+    #: resolver treats callee_text as a type name and emits an
+    #: edge to ``<lang>:<qualified_type>.<init>``. Distinct from
+    #: an ordinary call because there is no receiver to resolve
+    #: against.
+    is_constructor: bool = False
+
+    #: True when the syntactic form is ``lhs = rhs`` and ``lhs``
+    #: is a member access (``obj.Name`` or ``Class.Name``). The
+    #: resolver treats this as a property setter call: the target
+    #: canonical name is ``<qualified_owner>.set_<Name>`` and the
+    #: RHS is the sole positional argument. We over-emit here --
+    #: at extraction time we cannot always distinguish a property
+    #: assignment from a field assignment. The resolver drops
+    #: entries that don't match any known property; taint specs
+    #: filter the rest.
+    is_property_set: bool = False

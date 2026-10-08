@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from falconeye.domain.models.taint import FunctionDef, Location
+from falconeye.domain.models.taint import FunctionDef, Location, UnresolvedCall
 from falconeye.domain.services.taint_adapter import TaintLanguageAdapter
 from falconeye.infrastructure.taint_adapters.adapter_registry import AdapterRegistry
 from falconeye.infrastructure.taint_adapters.csharp import CSharpTaintAdapter
@@ -356,3 +356,244 @@ def test_config_max_hops_bounded():
         LanguageTaintConfig(enabled=True, max_hops=0)  # ge=1
     with pytest.raises(Exception):
         LanguageTaintConfig(enabled=True, max_hops=100)  # le=20
+
+# ---------------------------------------------------------------------
+# C# adapter -- extract_calls
+# ---------------------------------------------------------------------
+
+
+def _calls_by_flag(calls):
+    """Group calls by their (is_constructor, is_property_set, ordinary) role."""
+    ordinary = [c for c in calls if not c.is_constructor and not c.is_property_set]
+    ctors    = [c for c in calls if c.is_constructor]
+    setters  = [c for c in calls if c.is_property_set]
+    return ordinary, ctors, setters
+
+
+@pytest.mark.unit
+def test_extract_calls_ordinary_invocation(csharp_adapter):
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public void M() { obj.Foo(1, 2); }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    ordinary, ctors, setters = _calls_by_flag(calls)
+    assert len(ordinary) == 1 and not ctors and not setters
+    assert ordinary[0].callee_text == "obj.Foo"
+    assert ordinary[0].positional_arg_count == 2
+    assert ordinary[0].in_function == "csharp:X.Y.M"
+
+
+@pytest.mark.unit
+def test_extract_calls_namespace_qualified_static(csharp_adapter):
+    """Fully-qualified static calls are emitted with the full dotted
+    callee text -- the resolver strips using-shortened forms in a
+    later patch, but the raw name is what the extractor produces.
+    """
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public string M(string p) { return System.IO.File.ReadAllText(p); }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    ordinary, _, _ = _calls_by_flag(calls)
+    assert any(c.callee_text == "System.IO.File.ReadAllText" for c in ordinary)
+
+
+@pytest.mark.unit
+def test_extract_calls_bare_call(csharp_adapter):
+    """Bare `Helper()` (implicit this.Helper or static Helper) -- the
+    resolver disambiguates later; the extractor emits the raw name."""
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public void M() { Helper(); }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    ordinary, _, _ = _calls_by_flag(calls)
+    assert len(ordinary) == 1
+    assert ordinary[0].callee_text == "Helper"
+    assert ordinary[0].positional_arg_count == 0
+
+
+@pytest.mark.unit
+def test_extract_calls_constructor(csharp_adapter):
+    """`new SqlCommand(q, conn)` -> is_constructor=True, callee_text is
+    just the type name (resolver appends `.<init>`).
+    """
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public void M() { var cmd = new SqlCommand(q, conn); }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    _, ctors, _ = _calls_by_flag(calls)
+    assert len(ctors) == 1
+    assert ctors[0].callee_text == "SqlCommand"
+    assert ctors[0].positional_arg_count == 2
+    assert ctors[0].is_constructor is True
+    assert ctors[0].is_property_set is False
+    assert ctors[0].in_function == "csharp:X.Y.M"
+
+
+@pytest.mark.unit
+def test_extract_calls_property_setter(csharp_adapter):
+    """`obj.Name = value` -> is_property_set=True, positional_arg_count=1
+    (RHS is treated as the single value argument, matching the
+    `tainted_args: [value]` shape in the taint spec YAMLs)."""
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public void M() { cmd.CommandText = q; }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    _, _, setters = _calls_by_flag(calls)
+    assert len(setters) == 1
+    assert setters[0].callee_text == "cmd.CommandText"
+    assert setters[0].positional_arg_count == 1
+    assert setters[0].is_property_set is True
+    assert setters[0].is_constructor is False
+
+
+@pytest.mark.unit
+def test_extract_calls_ignores_plain_identifier_assignment(csharp_adapter):
+    """`x = y` (identifier LHS, not member access) is NOT a property
+    setter and must not be emitted.
+    """
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public void M() { int x = 3; x = 4; }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_extract_calls_chained(csharp_adapter):
+    """foo.Bar().Baz() emits both calls (outer + inner) with correct
+    positional argument counts. Chained calls are the typical
+    pattern in LINQ / fluent APIs -- both must appear in the graph."""
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public void M() { foo.Bar(1).Baz(2, 3); }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    ordinary, _, _ = _calls_by_flag(calls)
+    callees = [(c.callee_text, c.positional_arg_count) for c in ordinary]
+    assert ("foo.Bar", 1) in callees
+    assert ("foo.Bar(1).Baz", 2) in callees
+
+
+@pytest.mark.unit
+def test_extract_calls_in_constructor_body(csharp_adapter):
+    """Calls inside a constructor attribute to `<init>` in_function."""
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public Y(string s) { InitializeFrom(s); }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    ordinary, _, _ = _calls_by_flag(calls)
+    assert len(ordinary) == 1
+    assert ordinary[0].callee_text == "InitializeFrom"
+    assert ordinary[0].in_function == "csharp:X.Y.<init>"
+
+
+@pytest.mark.unit
+def test_extract_calls_in_property_accessor(csharp_adapter):
+    """A call inside a property setter body attributes to set_X;
+    a call inside a getter attributes to get_X."""
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        private string _name;
+        public string Name {
+            get { return Normalize(_name); }
+            set { _name = Sanitize(value); }
+        }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "Y.cs")
+    by_fn = {c.callee_text: c.in_function for c in calls if not c.is_property_set}
+    assert by_fn.get("Normalize") == "csharp:X.Y.get_Name"
+    assert by_fn.get("Sanitize") == "csharp:X.Y.set_Name"
+
+
+@pytest.mark.unit
+def test_extract_calls_drops_calls_outside_functions(csharp_adapter):
+    """Top-level statements have no enclosing function; their calls
+    are dropped (they cannot participate in a call-graph edge)."""
+    src = 'System.Console.WriteLine("hello");\n'
+    assert csharp_adapter.extract_calls(src, "top.cs") == []
+
+
+@pytest.mark.unit
+def test_extract_calls_end_to_end_sql_injection_shape(csharp_adapter):
+    """The canonical shape the csharp_generic.yaml specs target:
+    a SqlCommand constructor AND a CommandText setter in the same
+    method, both attributed to the enclosing GetById."""
+    src = textwrap.dedent("""
+    namespace MyApp.Web;
+    public class UserController {
+        public string GetById(int id) {
+            var query = "SELECT * FROM users WHERE id=" + id;
+            var cmd = new SqlCommand(query, _conn);
+            cmd.CommandText = query;
+            return cmd.ExecuteReader().ToString();
+        }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "UserController.cs")
+    ordinary, ctors, setters = _calls_by_flag(calls)
+    # Constructor sink
+    assert any(c.callee_text == "SqlCommand" and c.positional_arg_count == 2
+               for c in ctors)
+    # Property setter sink
+    assert any(c.callee_text == "cmd.CommandText" for c in setters)
+    # All calls attribute to the enclosing method
+    expected_fn = "csharp:MyApp.Web.UserController.GetById"
+    assert all(c.in_function == expected_fn for c in calls)
+
+
+@pytest.mark.unit
+def test_extract_calls_default_returns_empty_on_base_class():
+    """The base TaintLanguageAdapter provides a concrete extract_calls
+    that returns [] -- this is what enables partial adapters to be
+    valid contributors while still growing the interface."""
+    class Minimal(TaintLanguageAdapter):
+        language = "made_up"
+        def extract_functions(self, source, file_path): return []
+        def detect_frameworks(self, project_root): return []
+    m = Minimal()
+    assert m.extract_calls("anything", "any.file") == []
+
+
+@pytest.mark.unit
+def test_extract_calls_carries_location(csharp_adapter):
+    src = textwrap.dedent("""
+    namespace X;
+    public class Y {
+        public void M() {
+            foo();
+        }
+    }
+    """)
+    calls = csharp_adapter.extract_calls(src, "path/to/Y.cs")
+    assert calls[0].location.file_path == "path/to/Y.cs"
+    assert calls[0].location.line_start >= 1
+
+
+@pytest.mark.unit
+def test_extract_calls_empty_source(csharp_adapter):
+    assert csharp_adapter.extract_calls("", "empty.cs") == []

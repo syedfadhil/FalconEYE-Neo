@@ -39,7 +39,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tree_sitter_language_pack = None
 
-from ...domain.models.taint import FunctionDef, Location
+from ...domain.models.taint import FunctionDef, Location, UnresolvedCall
 from ...domain.services.taint_adapter import TaintLanguageAdapter
 
 
@@ -248,6 +248,322 @@ class CSharpTaintAdapter(TaintLanguageAdapter):
                 type_stack=type_stack,
                 out=out,
             )
+
+    # ------------------------------------------------------------------
+    # extract_calls
+    # ------------------------------------------------------------------
+
+    def extract_calls(self, source: str, file_path: str) -> List[UnresolvedCall]:
+        if self._parser is None:
+            return []
+
+        source_bytes = source.encode("utf-8")
+        tree = self._parser.parse(source_bytes)
+        out: List[UnresolvedCall] = []
+        self._walk_and_extract_calls(
+            node=tree.root_node,
+            source_bytes=source_bytes,
+            file_path=file_path,
+            namespace_stack=[],
+            type_stack=[],
+            current_function=None,
+            out=out,
+        )
+        return out
+
+    def _walk_and_extract_calls(
+        self,
+        *,
+        node,
+        source_bytes: bytes,
+        file_path: str,
+        namespace_stack: List[str],
+        type_stack: List[str],
+        current_function: Optional[str],
+        out: List[UnresolvedCall],
+    ) -> None:
+        """DFS mirroring _walk_and_extract, but tracking a current
+        enclosing function and emitting UnresolvedCall entries at
+        invocation / object-creation / property-assign nodes.
+
+        Calls that appear outside any function body (top-level
+        statements) have ``current_function == None`` and are
+        dropped -- they cannot participate in a call-graph edge.
+        """
+        t = node.type
+
+        # File-scoped namespace: siblings, not children (same
+        # handling as _walk_and_extract).
+        if t == "compilation_unit":
+            current_ns = list(namespace_stack)
+            for child in node.children:
+                if child.type == "file_scoped_namespace_declaration":
+                    name = self._text_of_field(child, "name", source_bytes)
+                    if name:
+                        current_ns.append(name)
+                    continue
+                self._walk_and_extract_calls(
+                    node=child,
+                    source_bytes=source_bytes,
+                    file_path=file_path,
+                    namespace_stack=current_ns,
+                    type_stack=type_stack,
+                    current_function=current_function,
+                    out=out,
+                )
+            return
+
+        if t == "namespace_declaration":
+            name = self._text_of_field(node, "name", source_bytes)
+            new_ns = list(namespace_stack)
+            if name:
+                new_ns.append(name)
+            for child in node.children:
+                self._walk_and_extract_calls(
+                    node=child,
+                    source_bytes=source_bytes,
+                    file_path=file_path,
+                    namespace_stack=new_ns,
+                    type_stack=type_stack,
+                    current_function=current_function,
+                    out=out,
+                )
+            return
+
+        if t in _TYPE_CONTAINER_NODES:
+            name = self._text_of_field(node, "name", source_bytes)
+            new_type_stack = type_stack + ([name] if name else [])
+            for child in node.children:
+                self._walk_and_extract_calls(
+                    node=child,
+                    source_bytes=source_bytes,
+                    file_path=file_path,
+                    namespace_stack=namespace_stack,
+                    type_stack=new_type_stack,
+                    current_function=current_function,
+                    out=out,
+                )
+            return
+
+        # Entering a method-like node ESTABLISHES the enclosing
+        # function context for its body. Nested local functions
+        # inherit their PARENT method as in_function -- we do not
+        # emit local functions as FunctionDefs (see
+        # _function_def_from_method), so attributing their calls
+        # to the parent is the only sensible choice.
+        if t in _METHOD_LIKE_NODES and t != "local_function_statement":
+            method_canonical = self._method_canonical_name(
+                node=node,
+                source_bytes=source_bytes,
+                namespace_stack=namespace_stack,
+                type_stack=type_stack,
+            )
+            for child in node.children:
+                self._walk_and_extract_calls(
+                    node=child,
+                    source_bytes=source_bytes,
+                    file_path=file_path,
+                    namespace_stack=namespace_stack,
+                    type_stack=type_stack,
+                    current_function=method_canonical or current_function,
+                    out=out,
+                )
+            return
+
+        # Property accessor bodies. Each accessor establishes its
+        # own enclosing function (get_X or set_X); we walk the
+        # accessors individually so calls attribute correctly.
+        if t in _PROPERTY_LIKE_NODES:
+            prop_name = self._text_of_field(node, "name", source_bytes)
+            if not prop_name and node.type == "indexer_declaration":
+                prop_name = "Item"
+            for accessor_kind, accessor_node in self._iter_accessors(node):
+                resolved_kind = "set" if accessor_kind == "init" else accessor_kind
+                if not prop_name:
+                    continue
+                member = f"{resolved_kind}_{prop_name}"
+                accessor_canonical = self._assemble_canonical(
+                    namespace_stack=namespace_stack,
+                    type_stack=type_stack,
+                    member=member,
+                )
+                for child in accessor_node.children:
+                    self._walk_and_extract_calls(
+                        node=child,
+                        source_bytes=source_bytes,
+                        file_path=file_path,
+                        namespace_stack=namespace_stack,
+                        type_stack=type_stack,
+                        current_function=accessor_canonical or current_function,
+                        out=out,
+                    )
+            return
+
+        # ---- CALL SITE NODES ----
+        if t == "invocation_expression" and current_function is not None:
+            function_field = node.child_by_field_name("function")
+            args_field = node.child_by_field_name("arguments")
+            if function_field is not None:
+                callee = source_bytes[
+                    function_field.start_byte:function_field.end_byte
+                ].decode("utf-8", errors="replace")
+                out.append(UnresolvedCall(
+                    callee_text=callee,
+                    location=self._location_of(node, file_path),
+                    in_function=current_function,
+                    positional_arg_count=self._count_positional_args(args_field),
+                ))
+            # Recurse to catch chained calls: foo.Bar().Baz() has
+            # an outer invocation_expression whose function is a
+            # member_access_expression containing the inner call.
+            for child in node.children:
+                self._walk_and_extract_calls(
+                    node=child,
+                    source_bytes=source_bytes,
+                    file_path=file_path,
+                    namespace_stack=namespace_stack,
+                    type_stack=type_stack,
+                    current_function=current_function,
+                    out=out,
+                )
+            return
+
+        if t == "object_creation_expression" and current_function is not None:
+            type_field = node.child_by_field_name("type")
+            args_field = node.child_by_field_name("arguments")
+            if type_field is not None:
+                callee = source_bytes[
+                    type_field.start_byte:type_field.end_byte
+                ].decode("utf-8", errors="replace")
+                out.append(UnresolvedCall(
+                    callee_text=callee,
+                    location=self._location_of(node, file_path),
+                    in_function=current_function,
+                    positional_arg_count=self._count_positional_args(args_field),
+                    is_constructor=True,
+                ))
+            # Constructor args may themselves contain calls or
+            # constructors -- recurse into the whole subtree.
+            for child in node.children:
+                self._walk_and_extract_calls(
+                    node=child,
+                    source_bytes=source_bytes,
+                    file_path=file_path,
+                    namespace_stack=namespace_stack,
+                    type_stack=type_stack,
+                    current_function=current_function,
+                    out=out,
+                )
+            return
+
+        if t == "assignment_expression" and current_function is not None:
+            left = node.child_by_field_name("left")
+            # Only member-access LHS is potentially a property setter.
+            # Plain identifier LHS (`x = y`) and element access
+            # (`x[i] = y`) don't map to property setters we can
+            # resolve against the taint spec vocabulary today.
+            if left is not None and left.type == "member_access_expression":
+                lhs_text = source_bytes[
+                    left.start_byte:left.end_byte
+                ].decode("utf-8", errors="replace")
+                out.append(UnresolvedCall(
+                    callee_text=lhs_text,
+                    location=self._location_of(node, file_path),
+                    in_function=current_function,
+                    # Property setters take a single value; matches
+                    # `tainted_args: [value]` in the spec YAMLs.
+                    positional_arg_count=1,
+                    is_property_set=True,
+                ))
+            # RHS may itself contain calls (e.g. `x.Prop = Foo()`).
+            for child in node.children:
+                self._walk_and_extract_calls(
+                    node=child,
+                    source_bytes=source_bytes,
+                    file_path=file_path,
+                    namespace_stack=namespace_stack,
+                    type_stack=type_stack,
+                    current_function=current_function,
+                    out=out,
+                )
+            return
+
+        # Default recursion.
+        for child in node.children:
+            self._walk_and_extract_calls(
+                node=child,
+                source_bytes=source_bytes,
+                file_path=file_path,
+                namespace_stack=namespace_stack,
+                type_stack=type_stack,
+                current_function=current_function,
+                out=out,
+            )
+
+    def _method_canonical_name(
+        self,
+        *,
+        node,
+        source_bytes: bytes,
+        namespace_stack: List[str],
+        type_stack: List[str],
+    ) -> Optional[str]:
+        """Compute the canonical name of a method-like node.
+
+        Mirrors the naming rules in _function_def_from_method, but
+        without building a FunctionDef. Kept as a separate helper
+        so the walker can attribute calls without re-doing
+        parameter extraction, modifier checks, etc.
+        """
+        if node.type == "constructor_declaration":
+            member = "<init>"
+        elif node.type == "destructor_declaration":
+            member = "Finalize"
+        elif node.type in ("operator_declaration", "conversion_operator_declaration"):
+            op_text = self._text_of_field(node, "operator", source_bytes)
+            member = f"op_{op_text}" if op_text else None
+        else:
+            member = self._text_of_field(node, "name", source_bytes)
+        if not member:
+            return None
+        return self._assemble_canonical(
+            namespace_stack=namespace_stack,
+            type_stack=type_stack,
+            member=member,
+        )
+
+    def _iter_accessors(self, prop_node):
+        """Yield (kind, accessor_node) for each accessor on a property.
+
+        Companion to _find_property_accessors -- that helper returns
+        just the kind strings; this one returns the node too so the
+        call walker can descend into each accessor with the right
+        canonical name context.
+        """
+        results = []
+        def visit(n):
+            if n.type == "accessor_declaration":
+                for child in n.children:
+                    if child.type in _ACCESSOR_KEYWORDS:
+                        results.append((child.type, n))
+                        break
+            for c in n.children:
+                visit(c)
+        visit(prop_node)
+        return results
+
+    def _count_positional_args(self, args_node) -> int:
+        """Number of arguments in an argument_list, positional or named.
+
+        Named-argument handling is left to the resolver: named args
+        disrupt positional matching against ``tainted_args: [N]``,
+        and the fix requires knowing the callee's parameter list,
+        which the extractor does not have. Total count is still
+        useful for overload disambiguation.
+        """
+        if args_node is None:
+            return 0
+        return sum(1 for c in args_node.children if c.type == "argument")
 
     # ------------------------------------------------------------------
     # Method-like -> FunctionDef
