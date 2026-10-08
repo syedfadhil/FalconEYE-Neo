@@ -79,6 +79,14 @@ dev = [
   "falconeye[sage]"
 ]
 
+# Shipped data files: the built-in taint specifications live under
+# src/falconeye/taint_specs/ and are enumerated at runtime via
+# importlib.resources. Setuptools does not include non-.py files in
+# the wheel by default, so we declare them explicitly here.
+[tool.setuptools.package-data]
+"falconeye.taint_specs" = ["*.yaml", "*.md"]
+"falconeye.taint_specs._shared" = ["*.yaml"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
