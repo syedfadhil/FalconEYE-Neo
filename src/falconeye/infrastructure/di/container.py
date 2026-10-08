@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from typing import Optional
+import os
 from pathlib import Path
 
 from ..config.config_loader import ConfigLoader
@@ -35,6 +36,38 @@ from ...domain.services.entry_point_detector import (
     AspNetCoreEntryPointDetector,
     EntryPointDetectorRegistry,
 )
+
+
+def _resolve_skills_directory(
+    *,
+    config_value: str,
+    config_path: "Optional[str]",
+) -> Path:
+    """Resolve the effective skills directory.
+
+    Resolution order, highest priority first:
+
+      1. FALCONEYE_SKILLS_DIR environment variable (if set and non-empty).
+         Overrides everything. Handy for CI pipelines and portable configs
+         where the same config.yaml runs against a different skills library
+         on each machine.
+      2. The config value (config.skills.directory). Absolute paths (including
+         those starting with ~) are used as-is; relative paths resolve against
+         the config file's parent directory so ``./skills`` in ``~/proj/config.yaml``
+         means ``~/proj/skills``.
+
+    All paths get ``~`` and ``$VAR`` expansion via ``os.path.expanduser`` /
+    ``os.path.expandvars`` before being converted to Path.
+    """
+    env_value = os.environ.get("FALCONEYE_SKILLS_DIR", "").strip()
+    if env_value:
+        return Path(os.path.expandvars(os.path.expanduser(env_value)))
+
+    raw = os.path.expandvars(os.path.expanduser(config_value))
+    candidate = Path(raw)
+    if not candidate.is_absolute() and config_path is not None:
+        candidate = Path(config_path).resolve().parent / candidate
+    return candidate
 
 
 @dataclass
@@ -351,12 +384,12 @@ class DIContainer:
 
         skill_loader: Optional[SkillLoader] = None
         if getattr(config, "skills", None) is not None and config.skills.enabled:
-            skills_dir = Path(config.skills.directory)
-            if not skills_dir.is_absolute() and config_path is not None:
-                # Relative directories resolve against the config file location
-                # so `directory: ./skills` in ~/proj/config.yaml means ~/proj/skills.
-                skills_dir = Path(config_path).resolve().parent / skills_dir
+            skills_dir = _resolve_skills_directory(
+                config_value=config.skills.directory,
+                config_path=config_path,
+            )
             skill_loader = SkillLoader(directory=skills_dir)
+
 
         # Build review confirmation service if we have both a
         # taint adapter registry and taint index available. It

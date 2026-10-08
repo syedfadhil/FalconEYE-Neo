@@ -561,8 +561,14 @@ class SkillsConfig(BaseModel):
         description="Enable skill loading and the `falconeye skill` subcommand"
     )
     directory: str = Field(
-        default="./skills",
-        description="Path to the skills directory (relative to config file, or absolute)"
+        default="~/.falconeye/skills",
+        description=(
+            "Path to the skills directory. Absolute paths (including ~) are used as-is; "
+            "relative paths resolve against the config file location. The default is a "
+            "user-level location so skills stay a global asset shared across projects, "
+            "not something duplicated into every analyzed codebase. Overridable via the "
+            "FALCONEYE_SKILLS_DIR environment variable or the --skills-dir CLI flag."
+        ),
     )
     max_discovery_hits: int = Field(
         default=200,

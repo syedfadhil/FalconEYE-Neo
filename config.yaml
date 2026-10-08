@@ -206,8 +206,11 @@ logging:
 # audit procedures. When enabled, the CLI exposes `falconeye skill list`
 # to enumerate what's available. Execution (`skill run`) lands in Phase 1b.
 #
-# Uncomment and set the directory to point at your skills folder. Layout:
-#   <directory>/
+# Skills are a GLOBAL asset -- one library reused across projects -- so
+# the default lives at ~/.falconeye/skills (user-level), NOT alongside
+# each project. Directory layout:
+#
+#   ~/.falconeye/skills/
 #     injection-prevention/
 #       SKILL.md
 #     path-traversal-prevention/
@@ -215,9 +218,16 @@ logging:
 #     _shared/                   <-- underscore-prefixed dirs are skipped
 #       report-template.md
 #
-# Relative paths resolve against the location of this config file.
+# Resolution order (highest priority first):
+#   1. --skills-dir CLI flag       (bypasses config.skills.enabled)
+#   2. FALCONEYE_SKILLS_DIR env    (portable configs, CI pipelines)
+#   3. config.skills.directory     (this file); relative paths resolve
+#                                  against the config file's parent
+#   4. Default: ~/.falconeye/skills
+#
+# Uncomment and adjust if you keep skills somewhere else:
 #
 # skills:
 #   enabled: true
-#   directory: ./skills
-#   max_discovery_hits: 200      # cap across all discovery patterns per run
+#   directory: ~/.falconeye/skills   # or an absolute path
+#   max_discovery_hits: 200          # cap across all discovery patterns per run

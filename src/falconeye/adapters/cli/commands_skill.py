@@ -26,6 +26,7 @@ def skill_list_command(
     config_path: Optional[Path],
     console: Console,
     show_patterns: bool = False,
+    skills_dir_override: Optional[Path] = None,
 ) -> None:
     """List every skill discoverable in the configured skills directory.
 
@@ -38,18 +39,32 @@ def skill_list_command(
     Requires ``config.skills.enabled: true``. Exits non-zero with an
     explanatory error otherwise.
     """
-    container = DIContainer.create(
-        config_path=str(config_path) if config_path else None,
-    )
-    if container.skill_loader is None:
-        console.print("[red]Skills are not enabled in the config.[/red]")
-        console.print(
-            "Set [bold]config.skills.enabled: true[/bold] and configure "
-            "[bold]config.skills.directory[/bold] to point at your skills folder."
-        )
-        sys.exit(2)
+    # Import here (not at module top) because SkillLoader lives in the
+    # infrastructure layer and the CLI adapter should stay import-light.
+    from ...infrastructure.skills.skill_loader import SkillLoader
 
-    skill_dir = container.skill_loader.directory
+    if skills_dir_override is not None:
+        # --skills-dir on the command line bypasses config gating.
+        # The operator explicitly pointed at a directory; honor it even
+        # if config.skills.enabled=false. Useful for one-off inspection
+        # of a skill library without editing config.
+        skill_loader = SkillLoader(directory=skills_dir_override.expanduser())
+    else:
+        container = DIContainer.create(
+            config_path=str(config_path) if config_path else None,
+        )
+        if container.skill_loader is None:
+            console.print("[red]Skills are not enabled in the config.[/red]")
+            console.print(
+                "Set [bold]config.skills.enabled: true[/bold] and configure "
+                "[bold]config.skills.directory[/bold] to point at your skills folder, "
+                "set the [bold]FALCONEYE_SKILLS_DIR[/bold] environment variable, or "
+                "pass [bold]--skills-dir[/bold] on this command."
+            )
+            sys.exit(2)
+        skill_loader = container.skill_loader
+
+    skill_dir = skill_loader.directory
     if not skill_dir.exists():
         console.print(
             f"[red]Skills directory does not exist:[/red] {skill_dir}"
@@ -60,7 +75,7 @@ def skill_list_command(
         )
         sys.exit(2)
 
-    skills = container.skill_loader.load_all()
+    skills = skill_loader.load_all()
     if not skills:
         console.print(
             f"[yellow]No skills found in[/yellow] {skill_dir}"

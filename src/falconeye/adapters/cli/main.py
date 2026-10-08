@@ -722,6 +722,15 @@ def skill_list(
         "--show-patterns",
         help="Expand each skill's Step 1 discovery patterns for inspection",
     ),
+    skills_dir: Optional[Path] = typer.Option(
+        None,
+        "--skills-dir",
+        help=(
+            "Override the skills directory. Bypasses config.skills.enabled "
+            "and the FALCONEYE_SKILLS_DIR env var. Useful for one-off inspection."
+        ),
+        exists=False,   # allow non-existent so we can show a helpful error
+    ),
     config: Optional[Path] = typer.Option(
         None,
         "--config", "-c",
@@ -743,6 +752,7 @@ def skill_list(
         config_path=config,
         console=console,
         show_patterns=show_patterns,
+        skills_dir_override=skills_dir,
     )
 
 
