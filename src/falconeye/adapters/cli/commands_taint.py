@@ -98,6 +98,26 @@ def taint_command(
         f"Findings: {len(result.review.findings)}."
     )
 
+    # Verdict breakdown -- explains findings=0 when candidates>0.
+    # Prints only in verify mode (--no-verify has no verdicts to show).
+    if verify and result.candidate_paths:
+        counts = result.verdict_counts
+        tail = ""
+        if counts.get("call_failed", 0):
+            tail = f"  (call_failed={counts['call_failed']})"
+        console.print(
+            f"  Verdicts:  "
+            f"confirmed={counts['confirmed']}  "
+            f"uncertain={counts['uncertain']}  "
+            f"false_positive={counts['false_positive']}"
+            + tail
+        )
+        if counts["false_positive"] > 0 and len(result.review.findings) == 0:
+            console.print(
+                "  [yellow]All candidates rejected by verifier.[/yellow] "
+                "Run with [bold]--no-verify[/bold] to see raw candidates and inspect why."
+            )
+
     # Format and output using the same formatters the review command uses.
     fmt_name = output_format or container.config.output.default_format
     formatter = FormatterFactory.create(fmt_name)

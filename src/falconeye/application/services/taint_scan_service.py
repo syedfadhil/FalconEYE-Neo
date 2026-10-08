@@ -89,6 +89,28 @@ class TaintScanResult:
     candidate_paths: List[TaintPath]
     verdicts: Mapping[TaintPath, VerifierResult]
 
+    @property
+    def verdict_counts(self) -> Mapping[str, int]:
+        """Aggregate verdict distribution across verified candidates.
+
+        Useful for diagnostic output when a scan produces fewer
+        findings than candidates -- shows how many the LLM rejected.
+        ``call_failed`` overlaps with ``uncertain`` (a failed LLM
+        call yields verdict=uncertain with call_failed=True) so
+        counts don't sum to total candidates.
+        """
+        counts: dict = {
+            VERIFIER_VERDICT_CONFIRMED: 0,
+            VERIFIER_VERDICT_UNCERTAIN: 0,
+            VERIFIER_VERDICT_FALSE_POSITIVE: 0,
+            "call_failed": 0,
+        }
+        for v in self.verdicts.values():
+            counts[v.verdict] = counts.get(v.verdict, 0) + 1
+            if v.call_failed:
+                counts["call_failed"] += 1
+        return counts
+
 
 class TaintScanService:
     """End-to-end orchestrator for taint analysis.

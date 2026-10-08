@@ -572,3 +572,130 @@ def test_scan_service_verifier_failure_still_emits_finding_with_tag(
     assert result.review.findings
     for f in result.review.findings:
         assert "verifier:call_failed" in f.tags
+
+
+# ---------------------------------------------------------------------
+# TaintScanResult.verdict_counts (diagnostic aggregation)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_verdict_counts_empty(
+    csharp_registry, taint_index, tmp_path,
+):
+    """Empty repo -> no candidates -> all counts zero."""
+    llm = MockLLMService(response=_canned_response('confirmed'))
+    verifier = TaintVerifier(llm_service=llm)
+    service = TaintScanService(
+        adapter_registry=csharp_registry,
+        taint_index=taint_index,
+        verifier=verifier,
+    )
+    result = asyncio.run(service.scan(
+        repo_path=tmp_path, languages=['csharp'], max_hops=5,
+    ))
+    counts = result.verdict_counts
+    assert counts['confirmed'] == 0
+    assert counts['uncertain'] == 0
+    assert counts['false_positive'] == 0
+    assert counts['call_failed'] == 0
+
+
+@pytest.mark.unit
+def test_verdict_counts_all_confirmed(
+    csharp_registry, taint_index, tmp_path, sample_source,
+):
+    (tmp_path / 'UC.cs').write_text(sample_source)
+    llm = MockLLMService(response=_canned_response('confirmed'))
+    verifier = TaintVerifier(llm_service=llm)
+    service = TaintScanService(
+        adapter_registry=csharp_registry,
+        taint_index=taint_index,
+        verifier=verifier,
+    )
+    result = asyncio.run(service.scan(
+        repo_path=tmp_path, languages=['csharp'], max_hops=5,
+    ))
+    counts = result.verdict_counts
+    assert counts['confirmed'] == len(result.candidate_paths)
+    assert counts['false_positive'] == 0
+    assert counts['uncertain'] == 0
+
+
+@pytest.mark.unit
+def test_verdict_counts_all_false_positive_explains_zero_findings(
+    csharp_registry, taint_index, tmp_path, sample_source,
+):
+    """The exact scenario the diagnostic exists for: candidates > 0,
+    findings == 0. Verdict counts show it was verifier rejection."""
+    (tmp_path / 'UC.cs').write_text(sample_source)
+    llm = MockLLMService(response=_canned_response('false_positive'))
+    verifier = TaintVerifier(llm_service=llm)
+    service = TaintScanService(
+        adapter_registry=csharp_registry,
+        taint_index=taint_index,
+        verifier=verifier,
+    )
+    result = asyncio.run(service.scan(
+        repo_path=tmp_path, languages=['csharp'], max_hops=5,
+    ))
+    assert len(result.candidate_paths) > 0
+    assert len(result.review.findings) == 0
+    counts = result.verdict_counts
+    assert counts['false_positive'] == len(result.candidate_paths)
+    assert counts['confirmed'] == 0
+
+
+@pytest.mark.unit
+def test_verdict_counts_call_failed_overlaps_with_uncertain(
+    csharp_registry, taint_index, tmp_path, sample_source,
+):
+    """A crashed LLM call yields verdict=uncertain + call_failed=True.
+    Both counters increment -- documented behaviour."""
+    (tmp_path / 'UC.cs').write_text(sample_source)
+    llm = MockLLMService(raise_exc=True)
+    verifier = TaintVerifier(llm_service=llm)
+    service = TaintScanService(
+        adapter_registry=csharp_registry,
+        taint_index=taint_index,
+        verifier=verifier,
+    )
+    result = asyncio.run(service.scan(
+        repo_path=tmp_path, languages=['csharp'], max_hops=5,
+    ))
+    counts = result.verdict_counts
+    n = len(result.candidate_paths)
+    assert counts['uncertain'] == n
+    assert counts['call_failed'] == n
+    assert counts['confirmed'] == 0
+    assert counts['false_positive'] == 0
+
+
+@pytest.mark.unit
+def test_verdict_counts_mixed(
+    csharp_registry, taint_index, tmp_path, sample_source,
+):
+    """Alternating verdicts across candidates: counts reflect the mix."""
+    (tmp_path / 'UC.cs').write_text(sample_source)
+    # Callable response cycles through verdicts
+    verdicts_seq = ['confirmed', 'false_positive', 'uncertain', 'confirmed']
+    call_i = [0]
+    def cycling(system, user):
+        v = verdicts_seq[call_i[0] % len(verdicts_seq)]
+        call_i[0] += 1
+        return _canned_response(v)
+    llm = MockLLMService(response=cycling)
+    verifier = TaintVerifier(llm_service=llm)
+    service = TaintScanService(
+        adapter_registry=csharp_registry,
+        taint_index=taint_index,
+        verifier=verifier,
+    )
+    result = asyncio.run(service.scan(
+        repo_path=tmp_path, languages=['csharp'], max_hops=5,
+    ))
+    counts = result.verdict_counts
+    total_verdicts = counts['confirmed'] + counts['false_positive'] + counts['uncertain']
+    assert total_verdicts == len(result.candidate_paths)
+    # No LLM failures in this test
+    assert counts['call_failed'] == 0
