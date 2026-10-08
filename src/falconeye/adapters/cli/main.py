@@ -17,7 +17,7 @@ from .commands import (
 )
 from .commands_upgrade import upgrade_command
 from .commands_taint import taint_command
-from .commands_skill import skill_list_command
+from .commands_skill import skill_list_command, skill_run_command
 from .commands_taint_confirm import taint_confirm_command
 from .commands_projects import (
     projects_list_command,
@@ -739,6 +739,71 @@ def skill_list(
         config_path=config,
         console=console,
         show_patterns=show_patterns,
+    )
+
+
+
+@skill_app.command(name="run")
+def skill_run(
+    skill_name: str = typer.Argument(
+        ...,
+        help="Name of the skill to run (matches SkillDefinition.name)",
+    ),
+    workspace: Path = typer.Argument(
+        ...,
+        help="Path to the codebase to audit",
+        exists=True,
+    ),
+    output_format: str = typer.Option(
+        "console",
+        "--output", "-o",
+        help="Output format: console or json",
+    ),
+    output_file: Optional[Path] = typer.Option(
+        None,
+        "--output-file",
+        help="Write JSON output to this file (requires --output json)",
+    ),
+    skills_dir: Optional[Path] = typer.Option(
+        None,
+        "--skills-dir",
+        help="Override the skills directory (bypasses config gating)",
+        exists=False,
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config", "-c",
+        help="Path to config file",
+        exists=True,
+    ),
+):
+    """
+    Execute a skill against a workspace.
+
+    Runs the skill's Step 1 grep discovery to locate suspicious code,
+    then invokes the configured LLM once per file with discovery hits
+    to evaluate the code against the skill's audit procedure. Emits
+    findings in SecurityFinding shape (compatible with taint-confirm,
+    reporters, and the shape-tolerant JSON loader).
+
+    Requires a runnable skill (function=scan) with at least one
+    Step 1 discovery pattern. Skills with function=verify or
+    function=triage are rejected with a clear message pointing to
+    their respective pipeline stages.
+
+    Usage:
+        falconeye skill run injection-prevention Portal
+        falconeye skill run injection-prevention Portal --output json --output-file inj.json
+        falconeye skill run injection-prevention Portal --skills-dir ~/skills
+    """
+    skill_run_command(
+        skill_name=skill_name,
+        workspace=workspace,
+        output_format=output_format,
+        output_file=output_file,
+        config_path=config,
+        skills_dir_override=skills_dir,
+        console=console,
     )
 
 

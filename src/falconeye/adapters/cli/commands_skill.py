@@ -137,3 +137,187 @@ def _print_pattern_details(skills, console: Console) -> None:
             console.print(f"  [{i}] {desc}")
             console.print(f"      [dim]ext:[/dim] {ext_str}")
             console.print(f"      [dim]regex:[/dim] {regex_display}")
+
+
+
+def skill_run_command(
+    *,
+    skill_name: str,
+    workspace: Path,
+    output_format: str,
+    output_file: Optional[Path],
+    config_path: Optional[Path],
+    skills_dir_override: Optional[Path],
+    console: Console,
+) -> None:
+    """Execute a single skill against a workspace.
+
+    Loads the skill by name (matching ``SkillDefinition.name``), runs
+    the Step 1 grep discovery, invokes the LLM once per file with
+    discovery hits, and emits a SecurityReview with the LLM's
+    findings converted to SecurityFinding shape.
+
+    Same output modes as ``skill list`` -- console table or JSON. When
+    ``--output-file`` is set, JSON is written to disk; otherwise
+    console output goes to stdout.
+    """
+    import asyncio
+    import json as _json
+    import sys as _sys
+
+    # Import here to keep the module import-light (skills lives in
+    # infrastructure, and the CLI adapter should not pull the whole
+    # tree in at import time).
+    from ...application.services.skill_runner_service import SkillRunnerService
+    from ...infrastructure.skills.skill_loader import SkillLoader
+
+    # -- Resolve the skill loader (config or override) --
+    if skills_dir_override is not None:
+        skill_loader = SkillLoader(directory=skills_dir_override.expanduser())
+    else:
+        container = DIContainer.create(
+            config_path=str(config_path) if config_path else None,
+        )
+        if container.skill_loader is None:
+            console.print("[red]Skills are not enabled in the config.[/red]")
+            console.print(
+                "Set [bold]config.skills.enabled: true[/bold] and configure "
+                "[bold]config.skills.directory[/bold], set the "
+                "[bold]FALCONEYE_SKILLS_DIR[/bold] environment variable, or "
+                "pass [bold]--skills-dir[/bold] on this command."
+            )
+            _sys.exit(2)
+        skill_loader = container.skill_loader
+
+    # -- Load the skill by name --
+    all_skills = skill_loader.load_all()
+    matches = [s for s in all_skills if s.name == skill_name]
+    if not matches:
+        available = ", ".join(sorted(s.name for s in all_skills)) or "(none)"
+        console.print(f"[red]Skill '{skill_name}' not found.[/red]")
+        console.print(f"[dim]Available skills:[/dim] {available}")
+        _sys.exit(2)
+    skill = matches[0]
+
+    # -- Gate on runnability early with an actionable message --
+    if not skill.is_runnable_today:
+        fn = skill.metadata.function or "unknown"
+        console.print(
+            f"[yellow]Skill '{skill_name}' has function=[bold]{fn}[/bold], "
+            "which is not executable via [bold]skill run[/bold].[/yellow]"
+        )
+        console.print(
+            "  verify skills route through fp-check (Phase 3, pending).\n"
+            "  triage skills route through the triage stage (Phase 4, pending)."
+        )
+        _sys.exit(2)
+
+    if not skill.discovery_patterns:
+        console.print(
+            f"[yellow]Skill '{skill_name}' has no Step 1 discovery patterns.[/yellow]"
+        )
+        console.print(
+            "Whole-workspace LLM-only execution is deferred to Phase 1c. "
+            "Add at least one grep command inside a bash code block under "
+            "the Step 1 heading."
+        )
+        _sys.exit(2)
+
+    if not workspace.exists():
+        console.print(f"[red]Workspace path does not exist:[/red] {workspace}")
+        _sys.exit(2)
+
+    # -- Get the LLM service from the DI container --
+    container = DIContainer.create(
+        config_path=str(config_path) if config_path else None,
+    )
+    llm_service = getattr(container, "llm_service", None)
+    if llm_service is None:
+        console.print(
+            "[red]No LLM service configured.[/red] Check the "
+            "[bold]llm[/bold] section of your config."
+        )
+        _sys.exit(2)
+
+    runner = SkillRunnerService(llm_service=llm_service)
+
+    # -- Run --
+    console.print(
+        f"[cyan]Running skill[/cyan] [bold]{skill.name}[/bold] "
+        f"against [cyan]{workspace}[/cyan]"
+    )
+    console.print(
+        f"[dim]{len(skill.discovery_patterns)} discovery pattern"
+        f"{'s' if len(skill.discovery_patterns) != 1 else ''}"
+        f", category={skill.metadata.category or 'unknown'}[/dim]"
+    )
+
+    try:
+        review, summary = asyncio.run(runner.run(skill=skill, workspace=workspace))
+    except ValueError as e:
+        # Runner rejects unrunnable skills with ValueError -- we
+        # pre-checked above but the runner is defensive too.
+        console.print(f"[red]{e}[/red]")
+        _sys.exit(2)
+
+    # -- Summary line --
+    _print_run_summary(console, summary)
+
+    # -- Output --
+    if output_format == "json":
+        _write_findings_json(review, output_file, console)
+    else:
+        _print_findings_console(console, review)
+
+
+def _print_run_summary(console: Console, summary) -> None:
+    """One-line-per-file diagnostic + total, then blank line."""
+    console.print(
+        f"\n[bold]Skill run summary[/bold]  "
+        f"[dim]({summary.total_discovery_hits} discovery hits, "
+        f"{summary.files_evaluated} files evaluated, "
+        f"{summary.files_with_llm_errors} with LLM errors, "
+        f"{summary.total_findings} findings)[/dim]"
+    )
+    if summary.files_with_llm_errors:
+        console.print("[yellow]Files with errors:[/yellow]")
+        for o in summary.outcomes:
+            if o.error:
+                console.print(f"  {o.file_path}: [red]{o.error}[/red]")
+    console.print()
+
+
+def _print_findings_console(console: Console, review) -> None:
+    """Render findings compactly for the console.
+
+    Reuses the ConsoleFormatter so output is consistent with what
+    `falconeye review` produces. This keeps the p16 taint-confirm
+    reporter enhancements (Reachability line, etc.) available when
+    a later patch adds --confirm-taint to `skill run`.
+    """
+    from ..formatters.console_formatter import ConsoleFormatter
+    formatter = ConsoleFormatter(use_color=True, verbose=False)
+    console.print(formatter.format_review(review))
+
+
+def _write_findings_json(review, output_file, console: Console) -> None:
+    """Emit findings as SecurityFinding.to_dict() JSON.
+
+    Uses the FLAT to_dict() shape (matching the taint-confirm output
+    contract from the loader-shapes patch) so downstream tools can
+    consume the output directly with the same shape-tolerant loader.
+    """
+    import json as _json
+    payload = {
+        "codebase_path": review.codebase_path,
+        "language": review.language,
+        "findings": [f.to_dict() for f in review.findings],
+    }
+    text = _json.dumps(payload, indent=2, default=str)
+    if output_file is None:
+        console.print(text)
+    else:
+        output_file.write_text(text, encoding="utf-8")
+        console.print(
+            f"[green]Wrote {len(review.findings)} findings to[/green] {output_file}"
+        )

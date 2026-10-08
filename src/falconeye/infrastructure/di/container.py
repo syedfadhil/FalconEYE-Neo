@@ -29,6 +29,7 @@ from ..taint_adapters.csharp import CSharpTaintAdapter
 from ...domain.services.taint_verifier import TaintVerifier
 from ...application.services.taint_scan_service import TaintScanService
 from ..skills.skill_loader import SkillLoader
+from ...application.services.skill_runner_service import SkillRunnerService
 from ...application.services.review_confirmation_service import ReviewConfirmationService
 from ...domain.services.entry_point_detector import (
     AspNetCoreEntryPointDetector,
@@ -80,6 +81,7 @@ class DIContainer:
     taint_adapter_registry: Optional[AdapterRegistry] = None
     taint_scan_service: Optional[TaintScanService] = None
     skill_loader: Optional[SkillLoader] = None
+    skill_runner_service: Optional[SkillRunnerService] = None
     review_confirmation_service: Optional[ReviewConfirmationService] = None
 
     @classmethod
@@ -369,6 +371,13 @@ class DIContainer:
                 taint_index=taint_scan_service._taint_index,
             )
 
+        # Build the skill runner when we have both an LLM service
+        # and a skill loader wired up. The runner is stateless so we
+        # construct one per container and reuse it across skill runs.
+        skill_runner_service: Optional[SkillRunnerService] = None
+        if skill_loader is not None and llm_service is not None:
+            skill_runner_service = SkillRunnerService(llm_service=llm_service)
+
         return cls(
             config=config,
             llm_service=llm_service,
@@ -390,6 +399,7 @@ class DIContainer:
             taint_adapter_registry=taint_adapter_registry,
             taint_scan_service=taint_scan_service,
             skill_loader=skill_loader,
+            skill_runner_service=skill_runner_service,
             review_confirmation_service=review_confirmation_service,
         )
 
