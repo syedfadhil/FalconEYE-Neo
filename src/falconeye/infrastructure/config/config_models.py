@@ -1,6 +1,6 @@
 """Configuration data models using Pydantic."""
 
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 
@@ -365,6 +365,51 @@ class AnalysisConfig(BaseModel):
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
 
 
+class LanguageTaintConfig(BaseModel):
+    """Per-language taint analysis settings.
+
+    Nothing runs unless ``enabled`` is set true. Defaults are
+    chosen so an operator opting in gets sensible behaviour
+    without further tuning:
+      - ``max_hops`` bounds the path finder; 5 is generous for
+        most codebases and cheap for the LLM verifier
+      - ``specs`` empty means "auto-detect frameworks from the
+        scanned repo"; a non-empty list pins the spec set
+        (useful for reproducible CI runs)
+      - ``framework_autodetect`` gates the .csproj / requirements
+        scan; set false when ``specs`` is pinned
+    """
+    enabled: bool = Field(
+        default=False,
+        description="Enable taint analysis for this language",
+    )
+    max_hops: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum call-graph edges to traverse from source to sink",
+    )
+    specs: List[str] = Field(
+        default_factory=list,
+        description="Explicit spec-file names (empty means auto-detect)",
+    )
+    framework_autodetect: bool = Field(
+        default=True,
+        description="Detect frameworks via project files (.csproj, requirements.txt, ...)",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class LanguageSettings(BaseModel):
+    """Per-language settings block. Currently only holds taint;
+    a nested block lets future settings (linter overrides, plugin
+    tuning, etc.) coexist without polluting the top-level config."""
+    taint: LanguageTaintConfig = Field(default_factory=LanguageTaintConfig)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class LanguagesConfig(BaseModel):
     """Language support configuration."""
     enabled: List[str] = Field(
@@ -382,6 +427,12 @@ class LanguagesConfig(BaseModel):
         ],
         description="List of enabled languages"
     )
+    per_language: Dict[str, LanguageSettings] = Field(
+        default_factory=dict,
+        description="Per-language settings (taint config, future overrides). Keys are language tags from `enabled`.",
+    )
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class FileDiscoveryConfig(BaseModel):

@@ -23,6 +23,9 @@ from ...domain.services.checksum_service import ChecksumService
 from ...application.commands.index_codebase import IndexCodebaseHandler
 from ...application.commands.review_file import ReviewFileHandler
 from ..persistence.checkpoint_service import CheckpointService
+from ..taint_index import TaintIndex, load_taint_index
+from ..taint_adapters.adapter_registry import AdapterRegistry
+from ..taint_adapters.csharp import CSharpTaintAdapter
 
 
 @dataclass
@@ -61,6 +64,12 @@ class DIContainer:
 
     # Optional Services
     memory_service: Optional[MemoryService] = None
+
+    # Optional taint analysis services. Both are None when no
+    # language in config.languages.per_language has taint enabled --
+    # this keeps startup cheap for the default install path.
+    taint_index: Optional[TaintIndex] = None
+    taint_adapter_registry: Optional[AdapterRegistry] = None
 
     @classmethod
     def create(cls, config_path: Optional[str] = None, backend_override: Optional[str] = None, sage_override: bool = False) -> "DIContainer":
@@ -299,6 +308,26 @@ class DIContainer:
         checkpoint_dir = Path(config.vector_store.persist_directory).parent / "checkpoints"
         checkpoint_service = CheckpointService(checkpoint_dir)
 
+        # Taint analysis wiring. Only constructs when at least one
+        # language explicitly opts in via config.languages.per_language.
+        # See taint_specs/SCHEMA.md for the spec vocabulary the index
+        # loads. The adapter registry is populated only for languages
+        # that both (a) opted in AND (b) have a shipped adapter.
+        taint_index: Optional[TaintIndex] = None
+        taint_adapter_registry: Optional[AdapterRegistry] = None
+        taint_enabled_languages = [
+            lang
+            for lang, settings in config.languages.per_language.items()
+            if settings.taint.enabled and lang in config.languages.enabled
+        ]
+        if taint_enabled_languages:
+            taint_index = load_taint_index(languages=taint_enabled_languages)
+            taint_adapter_registry = AdapterRegistry()
+            for lang in taint_enabled_languages:
+                if lang == "csharp":
+                    taint_adapter_registry.register(CSharpTaintAdapter())
+                # Additional adapters register here as they land.
+
         return cls(
             config=config,
             llm_service=llm_service,
@@ -316,6 +345,8 @@ class DIContainer:
             index_handler=index_handler,
             review_file_handler=review_file_handler,
             checkpoint_service=checkpoint_service,
+            taint_index=taint_index,
+            taint_adapter_registry=taint_adapter_registry,
         )
 
     def get_system_prompt(self, language: str) -> str:

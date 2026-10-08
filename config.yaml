@@ -136,6 +136,24 @@ languages:
     - php
     - csharp
 
+  # Per-language settings. Only the taint sub-block is used today;
+  # a nested structure lets future per-language settings (linter
+  # overrides, plugin tuning) coexist without churn.
+  #
+  # Taint analysis is opt-in. When any language enables it, the DI
+  # container loads the shipped taint specs from taint_specs/ and
+  # constructs the adapter registry. See taint_specs/SCHEMA.md for
+  # the spec vocabulary and framework auto-detection rules.
+  # Uncomment `per_language` and one or more language blocks below
+  # to enable. Absent block == taint disabled (this is the default).
+  # per_language:
+  #   csharp:
+  #     taint:
+  #       enabled: true                 # master switch for taint analysis on this language
+  #       max_hops: 5                   # call-graph edges from source to sink (1-20)
+  #       specs: []                     # empty = auto-detect frameworks from project files
+  #       framework_autodetect: true    # scan .csproj files for Microsoft.AspNetCore etc.
+
 # File Discovery
 file_discovery:
   default_exclusions:
