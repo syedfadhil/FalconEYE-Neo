@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from falconeye.domain.models.taint import FunctionDef, Location, UnresolvedCall
+from falconeye.domain.models.taint import (
+    FileResolutionContext,
+    FunctionDef,
+    Location,
+    MethodResolutionContext,
+    UnresolvedCall,
+)
 from falconeye.domain.services.taint_adapter import TaintLanguageAdapter
 from falconeye.infrastructure.taint_adapters.adapter_registry import AdapterRegistry
 from falconeye.infrastructure.taint_adapters.csharp import CSharpTaintAdapter
@@ -597,3 +603,373 @@ def test_extract_calls_carries_location(csharp_adapter):
 @pytest.mark.unit
 def test_extract_calls_empty_source(csharp_adapter):
     assert csharp_adapter.extract_calls("", "empty.cs") == []
+
+
+# ---------------------------------------------------------------------
+# C# adapter -- build_resolution_context
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_context_captures_usings(csharp_adapter):
+    src = textwrap.dedent('''
+    using System.Data.SqlClient;
+    using System.IO;
+    using static System.Console;
+    namespace X;
+    public class Y {
+        public void M() { }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    assert 'System.Data.SqlClient' in ctx.usings
+    assert 'System.IO' in ctx.usings
+    assert 'System.Console' in ctx.static_usings
+    assert ctx.file_namespace == 'X'
+
+
+@pytest.mark.unit
+def test_context_using_alias_ignored(csharp_adapter):
+    """Aliased usings are silently dropped (deferred to follow-up)."""
+    src = textwrap.dedent('''
+    using MyList = System.Collections.Generic.List<int>;
+    namespace X;
+    public class Y { public void M() { } }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    # Neither the alias NOR the target should end up in usings.
+    assert 'MyList' not in ctx.usings
+    assert 'System.Collections.Generic.List' not in ctx.usings
+
+
+@pytest.mark.unit
+def test_context_captures_variable_types_explicit(csharp_adapter):
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public void M() {
+            SqlCommand cmd = null;
+            string query = null;
+        }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    mctx = ctx.method_contexts['csharp:X.Y.M']
+    assert mctx.variable_types['cmd'] == 'SqlCommand'
+    assert mctx.variable_types['query'] == 'string'
+
+
+@pytest.mark.unit
+def test_context_captures_var_inference(csharp_adapter):
+    """`var x = new Type(...)` infers x's type as Type."""
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public void M() {
+            var cmd = new SqlCommand(q);
+        }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    mctx = ctx.method_contexts['csharp:X.Y.M']
+    assert mctx.variable_types['cmd'] == 'SqlCommand'
+
+
+@pytest.mark.unit
+def test_context_var_with_nonliteral_skipped(csharp_adapter):
+    """`var x = Foo()` cannot be inferred without flow types; skipped."""
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public void M() { var cmd = GetIt(); }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    mctx = ctx.method_contexts['csharp:X.Y.M']
+    assert 'cmd' not in mctx.variable_types
+
+
+@pytest.mark.unit
+def test_context_captures_parameters(csharp_adapter):
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public void M(SqlCommand cmd, string q) { }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    mctx = ctx.method_contexts['csharp:X.Y.M']
+    assert mctx.variable_types['cmd'] == 'SqlCommand'
+    assert mctx.variable_types['q'] == 'string'
+
+
+@pytest.mark.unit
+def test_context_captures_class_fields(csharp_adapter):
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        private SqlCommand _cmd;
+        public string _q;
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    fields = ctx.class_fields['X.Y']
+    assert fields['_cmd'] == 'SqlCommand'
+    assert fields['_q'] == 'string'
+
+
+@pytest.mark.unit
+def test_context_property_setter_value_type(csharp_adapter):
+    """Inside a property setter body, `value` has the property's type."""
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public SqlCommand Cmd {
+            get { return null; }
+            set { _cmd = value; }
+        }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'Y.cs')
+    setter = ctx.method_contexts['csharp:X.Y.set_Cmd']
+    assert setter.variable_types['value'] == 'SqlCommand'
+
+
+# ---------------------------------------------------------------------
+# C# adapter -- resolve_call
+# ---------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def loaded_taint_index():
+    """The real shipped csharp_generic index -- what production uses."""
+    from falconeye.infrastructure.taint_index import load_taint_index
+    return load_taint_index(languages=['csharp'])
+
+
+def _resolve_one(adapter, src, call_index=0, *, taint_index):
+    ctx = adapter.build_resolution_context(src, 'test.cs')
+    calls = adapter.extract_calls(src, 'test.cs')
+    call = calls[call_index]
+    return adapter.resolve_call(call, ctx, taint_index), call
+
+
+@pytest.mark.unit
+def test_resolve_constructor_via_using(csharp_adapter, loaded_taint_index):
+    src = textwrap.dedent('''
+    using System.Data.SqlClient;
+    namespace X;
+    public class Y {
+        public void M() { var cmd = new SqlCommand(q, conn); }
+    }
+    ''')
+    resolved, _ = _resolve_one(csharp_adapter, src, taint_index=loaded_taint_index)
+    assert resolved == 'csharp:System.Data.SqlClient.SqlCommand.<init>'
+    assert loaded_taint_index.get_sink(resolved) is not None
+
+
+@pytest.mark.unit
+def test_resolve_property_setter_via_local_var(csharp_adapter, loaded_taint_index):
+    """Local var typed via var/new, property setter resolves through it."""
+    src = textwrap.dedent('''
+    using System.Data.SqlClient;
+    namespace X;
+    public class Y {
+        public void M(string q) {
+            var cmd = new SqlCommand(q, _conn);
+            cmd.CommandText = q;
+        }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'test.cs')
+    calls = csharp_adapter.extract_calls(src, 'test.cs')
+    prop_call = next(c for c in calls if c.is_property_set)
+    resolved = csharp_adapter.resolve_call(prop_call, ctx, loaded_taint_index)
+    assert resolved == 'csharp:System.Data.SqlClient.SqlCommand.set_CommandText'
+    assert loaded_taint_index.get_sink(resolved) is not None
+
+
+@pytest.mark.unit
+def test_resolve_property_setter_via_class_field(csharp_adapter, loaded_taint_index):
+    """Class field typed explicitly, setter resolves through field type."""
+    src = textwrap.dedent('''
+    using System.Data.SqlClient;
+    namespace X;
+    public class Y {
+        private SqlCommand _cmd;
+        public void M(string q) {
+            _cmd.CommandText = q;
+        }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'test.cs')
+    calls = csharp_adapter.extract_calls(src, 'test.cs')
+    prop_call = next(c for c in calls if c.is_property_set)
+    resolved = csharp_adapter.resolve_call(prop_call, ctx, loaded_taint_index)
+    assert resolved == 'csharp:System.Data.SqlClient.SqlCommand.set_CommandText'
+    assert loaded_taint_index.get_sink(resolved) is not None
+
+
+@pytest.mark.unit
+def test_resolve_fully_qualified_source(csharp_adapter, loaded_taint_index):
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public void M(string p) { System.IO.File.ReadAllText(p); }
+    }
+    ''')
+    resolved, _ = _resolve_one(csharp_adapter, src, taint_index=loaded_taint_index)
+    assert resolved == 'csharp:System.IO.File.ReadAllText'
+    assert loaded_taint_index.get_source(resolved) is not None
+
+
+@pytest.mark.unit
+def test_resolve_namespace_shortened_via_using(csharp_adapter, loaded_taint_index):
+    src = textwrap.dedent('''
+    using System.IO;
+    namespace X;
+    public class Y {
+        public void M(string p) { File.ReadAllText(p); }
+    }
+    ''')
+    resolved, _ = _resolve_one(csharp_adapter, src, taint_index=loaded_taint_index)
+    assert resolved == 'csharp:System.IO.File.ReadAllText'
+    assert loaded_taint_index.get_source(resolved) is not None
+
+
+@pytest.mark.unit
+def test_resolve_bare_call_via_static_using(csharp_adapter, loaded_taint_index):
+    """`using static X.Type;` + bare call resolves to X.Type.Method."""
+    # ReadLine is a shipped stdin source, so this doubles as an
+    # end-to-end spec-match check.
+    src = textwrap.dedent('''
+    using static System.Console;
+    namespace X;
+    public class Y {
+        public string M() { return ReadLine(); }
+    }
+    ''')
+    resolved, _ = _resolve_one(csharp_adapter, src, taint_index=loaded_taint_index)
+    assert resolved == 'csharp:System.Console.ReadLine'
+    assert loaded_taint_index.get_source(resolved) is not None
+
+
+@pytest.mark.unit
+def test_resolve_parameter_typed_receiver(csharp_adapter, loaded_taint_index):
+    """Method parameter with declared type resolves member access."""
+    src = textwrap.dedent('''
+    using System.Data.SqlClient;
+    namespace X;
+    public class Y {
+        public void M(SqlCommand cmd, string q) {
+            cmd.CommandText = q;
+        }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'test.cs')
+    calls = csharp_adapter.extract_calls(src, 'test.cs')
+    prop_call = next(c for c in calls if c.is_property_set)
+    resolved = csharp_adapter.resolve_call(prop_call, ctx, loaded_taint_index)
+    assert resolved == 'csharp:System.Data.SqlClient.SqlCommand.set_CommandText'
+
+
+@pytest.mark.unit
+def test_resolve_this_call(csharp_adapter, loaded_taint_index):
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public void M() { this.Helper(); }
+        private void Helper() { }
+    }
+    ''')
+    resolved, _ = _resolve_one(csharp_adapter, src, taint_index=loaded_taint_index)
+    # No spec match for user-defined; falls back to best-guess candidate
+    # which is the this-scope resolution.
+    assert resolved == 'csharp:X.Y.Helper'
+
+
+@pytest.mark.unit
+def test_resolve_unresolvable_returns_none(csharp_adapter, loaded_taint_index):
+    """A call with no receiver in scope and no static usings returns None."""
+    # The chained-call outer part -- `foo.Bar().Baz` -- has receiver
+    # `foo.Bar()` which is not a variable or type. Currently the
+    # resolver treats `foo.Bar()` as a type path and tries to expand
+    # via usings; the resulting candidate almost certainly won't
+    # match the spec.
+    src = textwrap.dedent('''
+    namespace X;
+    public class Y {
+        public void M() { foo.Bar().Baz(); }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'test.cs')
+    calls = csharp_adapter.extract_calls(src, 'test.cs')
+    # Inner call `foo.Bar` -- receiver foo not in scope -> best guess
+    # but no spec match.
+    inner = next(c for c in calls if c.callee_text == 'foo.Bar')
+    resolved_inner = csharp_adapter.resolve_call(inner, ctx, loaded_taint_index)
+    assert loaded_taint_index.get_source(resolved_inner) is None
+    assert loaded_taint_index.get_sink(resolved_inner) is None
+
+
+@pytest.mark.unit
+def test_resolve_prefers_spec_match_over_first_candidate(csharp_adapter, loaded_taint_index):
+    """When multiple candidates exist (bare type + multiple usings),
+    the resolver picks the one that hits a spec entry.
+    """
+    src = textwrap.dedent('''
+    using SomeUnusedNamespace;
+    using System.Data.SqlClient;
+    using AnotherUnusedNamespace;
+    namespace X;
+    public class Y {
+        public void M() { var c = new SqlCommand(q, conn); }
+    }
+    ''')
+    resolved, _ = _resolve_one(csharp_adapter, src, taint_index=loaded_taint_index)
+    # Should pick the SqlClient version, not the first using in order.
+    assert resolved == 'csharp:System.Data.SqlClient.SqlCommand.<init>'
+
+
+@pytest.mark.unit
+def test_resolve_base_adapter_returns_none():
+    """Default resolve_call on TaintLanguageAdapter returns None."""
+    from falconeye.infrastructure.taint_index import load_taint_index
+    class Minimal(TaintLanguageAdapter):
+        language = 'made_up'
+        def extract_functions(self, source, file_path): return []
+        def detect_frameworks(self, project_root): return []
+    m = Minimal()
+    idx = load_taint_index(languages=['csharp'])
+    call = UnresolvedCall(
+        callee_text='foo', location=Location('x', 1, 1),
+        in_function='made_up:X.Y.M',
+    )
+    assert m.resolve_call(call, FileResolutionContext(file_path='x'), idx) is None
+
+
+@pytest.mark.unit
+def test_resolve_end_to_end_sql_injection_matches_spec(csharp_adapter, loaded_taint_index):
+    """The exact scenario csharp_generic.yaml is designed to catch:
+    a constructor sink + property setter sink both resolve to entries
+    the taint index recognizes.
+    """
+    src = textwrap.dedent('''
+    using System.Data.SqlClient;
+    namespace MyApp.Web;
+    public class UserController {
+        public string GetById(int id) {
+            var query = "SELECT * FROM users WHERE id=" + id;
+            var cmd = new SqlCommand(query, _conn);
+            cmd.CommandText = query;
+            return cmd.ExecuteReader().ToString();
+        }
+    }
+    ''')
+    ctx = csharp_adapter.build_resolution_context(src, 'UC.cs')
+    calls = csharp_adapter.extract_calls(src, 'UC.cs')
+    resolved = [csharp_adapter.resolve_call(c, ctx, loaded_taint_index) for c in calls]
+    sinks_hit = [r for r in resolved if r and loaded_taint_index.get_sink(r)]
+    assert 'csharp:System.Data.SqlClient.SqlCommand.<init>' in sinks_hit
+    assert 'csharp:System.Data.SqlClient.SqlCommand.set_CommandText' in sinks_hit
+

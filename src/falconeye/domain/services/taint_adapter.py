@@ -25,10 +25,23 @@ follows when adding a new language.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Optional, TYPE_CHECKING
 from pathlib import Path
 from typing import List
 
-from ..models.taint import FunctionDef, UnresolvedCall
+from ..models.taint import (
+    FileResolutionContext,
+    FunctionDef,
+    UnresolvedCall,
+)
+
+
+if TYPE_CHECKING:
+    # Only used in type hints. Avoids an import cycle:
+    # infrastructure.taint_index imports the adapter interface
+    # via the domain package, so importing TaintIndex here would
+    # create a runtime cycle.
+    from ...infrastructure.taint_index import TaintIndex
 
 
 class TaintLanguageAdapter(ABC):
@@ -102,6 +115,59 @@ class TaintLanguageAdapter(ABC):
             file_path: Path passed through to ``Location.file_path``.
         """
         return []
+
+    def build_resolution_context(
+        self,
+        source: str,
+        file_path: str,
+    ) -> FileResolutionContext:
+        """Extract everything the resolver will need for this file.
+
+        Collects:
+
+          * the enclosing namespace (from block-scoped or file-scoped
+            namespace declarations)
+          * ordinary and static ``using`` statements
+          * per-method local variable types (parameters, explicit
+            declarations, and ``var x = new T(...)`` inference)
+          * per-class field types
+
+        The default implementation returns an empty context, which
+        keeps the interface additive: a partial adapter without
+        resolution support still parses correctly, its calls just
+        won't resolve to anything.
+
+        Called once per file at scan start. The resulting context
+        is immutable and reusable across every ``resolve_call``
+        invocation for that file.
+        """
+        return FileResolutionContext(file_path=file_path)
+
+    def resolve_call(
+        self,
+        call: UnresolvedCall,
+        context: FileResolutionContext,
+        taint_index: "TaintIndex",
+    ) -> Optional[str]:
+        """Turn an :class:`UnresolvedCall` into a canonical name.
+
+        Return values:
+
+          * A canonical name matching an entry in ``taint_index``
+            (source, sink, sanitizer, or propagator). Preferred:
+            this is what taint findings ultimately need.
+          * A best-guess canonical name for user-defined code that
+            no spec covers. The graph builder can still use this
+            to add edges between application methods.
+          * ``None`` when the call cannot be resolved at all -- 
+            typically because the receiver's type isn't derivable
+            from the local context (chained calls, complex
+            expressions). The call is dropped from the graph.
+
+        The default implementation returns ``None`` so a partial
+        adapter still behaves sensibly.
+        """
+        return None
 
     @abstractmethod
     def detect_frameworks(self, project_root: Path) -> List[str]:

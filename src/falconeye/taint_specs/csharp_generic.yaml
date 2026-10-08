@@ -136,14 +136,14 @@ sinks:
     cwe: CWE-89
     severity: HIGH
 
-  - name: csharp:System.Data.SqlClient.SqlCommand.CommandText
+  - name: csharp:System.Data.SqlClient.SqlCommand.set_CommandText
     kind: sql_query
     tainted_args: [value]
     cwe: CWE-89
     severity: HIGH
     notes: Property setter. Same danger as passing SQL to the constructor.
 
-  - name: csharp:Microsoft.Data.SqlClient.SqlCommand.CommandText
+  - name: csharp:Microsoft.Data.SqlClient.SqlCommand.set_CommandText
     kind: sql_query
     tainted_args: [value]
     cwe: CWE-89
@@ -155,7 +155,7 @@ sinks:
     cwe: CWE-89
     severity: HIGH
 
-  - name: csharp:System.Data.OleDb.OleDbCommand.CommandText
+  - name: csharp:System.Data.OleDb.OleDbCommand.set_CommandText
     kind: sql_query
     tainted_args: [value]
     cwe: CWE-89
@@ -167,7 +167,7 @@ sinks:
     cwe: CWE-89
     severity: HIGH
 
-  - name: csharp:System.Data.Odbc.OdbcCommand.CommandText
+  - name: csharp:System.Data.Odbc.OdbcCommand.set_CommandText
     kind: sql_query
     tainted_args: [value]
     cwe: CWE-89
@@ -192,13 +192,13 @@ sinks:
     severity: CRITICAL
     notes: ProcessStartInfo(fileName) and ProcessStartInfo(fileName, args).
 
-  - name: csharp:System.Diagnostics.ProcessStartInfo.FileName
+  - name: csharp:System.Diagnostics.ProcessStartInfo.set_FileName
     kind: command_exec
     tainted_args: [value]
     cwe: CWE-78
     severity: CRITICAL
 
-  - name: csharp:System.Diagnostics.ProcessStartInfo.Arguments
+  - name: csharp:System.Diagnostics.ProcessStartInfo.set_Arguments
     kind: command_exec
     tainted_args: [value]
     cwe: CWE-78

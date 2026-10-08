@@ -19,8 +19,8 @@ See SCHEMA.md §2 for the full conventions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Mapping, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -101,3 +101,59 @@ class UnresolvedCall:
     #: entries that don't match any known property; taint specs
     #: filter the rest.
     is_property_set: bool = False
+
+@dataclass(frozen=True)
+class MethodResolutionContext:
+    """Resolution context for a single method or property accessor.
+
+    The variable_types map covers three sources:
+
+      * method parameters, keyed by parameter name
+      * local variables with explicit type annotation
+        (``SqlCommand cmd = ...``)
+      * local variables with inferred type from ``var`` when the
+        RHS is a ``new TypeName(...)`` expression
+
+    Class fields and inherited fields are handled at the file
+    level (see :class:`FileResolutionContext`), so a method's
+    map does not need to include them -- the resolver falls back
+    to the file context when a receiver is not a local variable.
+
+    Type names are stored RAW (as written in source): they may or
+    may not be namespace-qualified. The resolver expands them via
+    the file's using statements when producing a candidate name.
+    """
+    canonical_name: str
+    variable_types: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FileResolutionContext:
+    """Everything the resolver needs to know about one source file.
+
+    Produced once per file by ``TaintLanguageAdapter.build_resolution_context``
+    and passed to every ``resolve_call`` invocation for calls in
+    that file. Cheap to build; the payoff is that name resolution
+    itself becomes a series of dictionary lookups.
+
+    Fields:
+      file_path       -- passed through for diagnostic purposes
+      file_namespace  -- the enclosing namespace as a dotted string,
+                         or None for global-scope files. Covers
+                         both block-scoped and file-scoped forms.
+      usings          -- ordinary ``using Ns.Sub;`` targets
+      static_usings   -- ``using static Ns.Type;`` targets, which
+                         bring member methods into bare-name scope
+      class_fields    -- class-level field name -> raw type,
+                         keyed by the enclosing type's canonical
+                         name (matches FunctionDef.canonical_name
+                         without the trailing member)
+      method_contexts -- canonical method name ->
+                         MethodResolutionContext for that method
+    """
+    file_path: str
+    file_namespace: Optional[str] = None
+    usings: Tuple[str, ...] = ()
+    static_usings: Tuple[str, ...] = ()
+    class_fields: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    method_contexts: Mapping[str, MethodResolutionContext] = field(default_factory=dict)
