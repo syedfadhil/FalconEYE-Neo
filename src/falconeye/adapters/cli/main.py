@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 import typer
 from rich.console import Console
 
@@ -18,6 +18,7 @@ from .commands import (
 from .commands_upgrade import upgrade_command
 from .commands_taint import taint_command
 from .commands_skill import skill_list_command
+from .commands_taint_confirm import taint_confirm_command
 from .commands_projects import (
     projects_list_command,
     projects_info_command,
@@ -520,6 +521,71 @@ def taint(
         output_file=output_file,
         max_hops=max_hops,
         verify=verify,
+        config_path=config,
+        console=console,
+    )
+
+
+@app.command(name="taint-confirm")
+def taint_confirm(
+    path: Path = typer.Argument(
+        ...,
+        help="Path to codebase (used to build call graph and detect entry points)",
+        exists=True,
+    ),
+    findings_file: Path = typer.Option(
+        ...,
+        "--findings", "-f",
+        help="JSON file with findings from `falconeye review --output json`",
+        exists=True,
+    ),
+    output_format: str = typer.Option(
+        "console",
+        "--output", "-o",
+        help="Output format: console or json",
+    ),
+    output_file: Optional[Path] = typer.Option(
+        None,
+        "--output-file",
+        help="Write enriched findings JSON to this file (with --output json)",
+    ),
+    languages: Optional[List[str]] = typer.Option(
+        None,
+        "--language",
+        help="Languages to include (defaults to csharp)",
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config", "-c",
+        help="Path to config file",
+        exists=True,
+    ),
+):
+    """
+    Confirm review findings by call-graph reachability analysis.
+
+    Takes a JSON findings file produced by `falconeye review --output
+    json`, builds a call graph from the workspace at PATH, detects
+    entry points (HTTP controllers, middleware, etc.), and enriches
+    each finding with a taint_confirmation block indicating whether
+    its enclosing method is reachable from any entry point.
+
+    Confirmation is ADDITIVE signal, not subtractive. Findings marked
+    "not_confirmed" retain their original confidence -- they are NOT
+    dismissed. The confirmation is a boost for reachable code, not a
+    filter for the rest.
+
+    Usage:
+        falconeye review Portal --output json --output-file findings.json
+        falconeye taint-confirm Portal --findings findings.json
+        falconeye taint-confirm Portal -f findings.json -o json --output-file confirmed.json
+    """
+    taint_confirm_command(
+        path=path,
+        findings_file=findings_file,
+        output_format=output_format,
+        output_file=output_file,
+        languages=languages,
         config_path=config,
         console=console,
     )

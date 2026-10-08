@@ -29,6 +29,11 @@ from ..taint_adapters.csharp import CSharpTaintAdapter
 from ...domain.services.taint_verifier import TaintVerifier
 from ...application.services.taint_scan_service import TaintScanService
 from ..skills.skill_loader import SkillLoader
+from ...application.services.review_confirmation_service import ReviewConfirmationService
+from ...domain.services.entry_point_detector import (
+    AspNetCoreEntryPointDetector,
+    EntryPointDetectorRegistry,
+)
 
 
 @dataclass
@@ -75,6 +80,7 @@ class DIContainer:
     taint_adapter_registry: Optional[AdapterRegistry] = None
     taint_scan_service: Optional[TaintScanService] = None
     skill_loader: Optional[SkillLoader] = None
+    review_confirmation_service: Optional[ReviewConfirmationService] = None
 
     @classmethod
     def create(cls, config_path: Optional[str] = None, backend_override: Optional[str] = None, sage_override: bool = False) -> "DIContainer":
@@ -350,6 +356,19 @@ class DIContainer:
                 skills_dir = Path(config_path).resolve().parent / skills_dir
             skill_loader = SkillLoader(directory=skills_dir)
 
+        # Build review confirmation service if we have both a
+        # taint adapter registry and taint index available. It
+        # reuses the same infrastructure the taint scan uses.
+        review_confirmation_service: Optional[ReviewConfirmationService] = None
+        if taint_scan_service is not None:
+            entry_registry = EntryPointDetectorRegistry()
+            entry_registry.register(AspNetCoreEntryPointDetector())
+            review_confirmation_service = ReviewConfirmationService(
+                adapter_registry=taint_scan_service._adapter_registry,
+                entry_point_registry=entry_registry,
+                taint_index=taint_scan_service._taint_index,
+            )
+
         return cls(
             config=config,
             llm_service=llm_service,
@@ -371,6 +390,7 @@ class DIContainer:
             taint_adapter_registry=taint_adapter_registry,
             taint_scan_service=taint_scan_service,
             skill_loader=skill_loader,
+            review_confirmation_service=review_confirmation_service,
         )
 
     def get_system_prompt(self, language: str) -> str:

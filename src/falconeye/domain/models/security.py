@@ -4,6 +4,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List
+
+# Late import via TYPE_CHECKING is not needed here: the module
+# structure has models importing each other freely.
+from .confirmation import TaintConfirmation
 from uuid import UUID, uuid4
 
 
@@ -82,6 +86,15 @@ class SecurityFinding:
     verifier_reasoning: str = ""
     verifier_counterargument: str = ""
 
+    # --- Fields added by the review-confirmation patch. ---
+    # taint_confirmation: reachability confirmation result attached by
+    #     ReviewConfirmationService. When present, indicates whether
+    #     the finding's enclosing method is reachable from a known
+    #     entry point via call-graph analysis. See TaintConfirmation
+    #     docstring for status semantics. None means confirmation was
+    #     not run (older findings, non-confirmable finding, etc.).
+    taint_confirmation: Optional[TaintConfirmation] = None
+
     @classmethod
     def create(
         cls,
@@ -104,6 +117,7 @@ class SecurityFinding:
         verifier_verdict: Optional[str] = None,
         verifier_reasoning: str = "",
         verifier_counterargument: str = "",
+        taint_confirmation: Optional[TaintConfirmation] = None,
     ) -> "SecurityFinding":
         """Factory method to create a security finding."""
         return cls(
@@ -127,6 +141,7 @@ class SecurityFinding:
             verifier_verdict=verifier_verdict,
             verifier_reasoning=verifier_reasoning,
             verifier_counterargument=verifier_counterargument,
+            taint_confirmation=taint_confirmation,
         )
 
     def to_dict(self) -> dict:
@@ -152,6 +167,17 @@ class SecurityFinding:
             "verifier_verdict": self.verifier_verdict,
             "verifier_reasoning": self.verifier_reasoning,
             "verifier_counterargument": self.verifier_counterargument,
+            "taint_confirmation": (
+                {
+                    "status": self.taint_confirmation.status,
+                    "enclosing_function": self.taint_confirmation.enclosing_function,
+                    "reachable_entry_points": list(self.taint_confirmation.reachable_entry_points),
+                    "shortest_chain": list(self.taint_confirmation.shortest_chain),
+                    "hop_count": self.taint_confirmation.hop_count,
+                    "reason": self.taint_confirmation.reason,
+                }
+                if self.taint_confirmation is not None else None
+            ),
         }
 
 
