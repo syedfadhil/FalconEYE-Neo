@@ -1,12 +1,9 @@
 """
-`falconeye skill ...` CLI commands (Phase 1a: list only).
+`falconeye skill ...` CLI commands: list, lint, run, run-all.
 
 This module implements the plumbing invoked by the thin wrappers in
 main.py. Following the pattern established by the other commands_*.py
 modules: main.py owns the typer surface, this module owns the logic.
-
-Phase 1a exposes ``list`` only. ``run`` (execute a single skill via
-LLM) and ``run-all`` (batch execution) land in Phase 1b.
 """
 
 from __future__ import annotations
@@ -20,6 +17,41 @@ from rich.table import Table
 from rich.text import Text
 
 from ...infrastructure.di.container import DIContainer
+
+
+def _resolve_skill_loader(
+    *,
+    config_path: Optional[Path],
+    skills_dir_override: Optional[Path],
+    console: Console,
+):
+    """Return the SkillLoader every ``skill`` subcommand works from.
+
+    ``--skills-dir`` on the command line bypasses config gating: the
+    operator explicitly pointed at a directory, so honor it even if
+    config.skills.enabled=false. Otherwise the container decides, and
+    a disabled config exits 2 with a message naming all three ways to
+    enable skills.
+    """
+    # Import here (not at module top) because SkillLoader lives in the
+    # infrastructure layer and the CLI adapter should stay import-light.
+    from ...infrastructure.skills.skill_loader import SkillLoader
+
+    if skills_dir_override is not None:
+        return SkillLoader(directory=skills_dir_override.expanduser())
+    container = DIContainer.create(
+        config_path=str(config_path) if config_path else None,
+    )
+    if container.skill_loader is None:
+        console.print("[red]Skills are not enabled in the config.[/red]")
+        console.print(
+            "Set [bold]config.skills.enabled: true[/bold] and configure "
+            "[bold]config.skills.directory[/bold] to point at your skills folder, "
+            "set the [bold]FALCONEYE_SKILLS_DIR[/bold] environment variable, or "
+            "pass [bold]--skills-dir[/bold] on this command."
+        )
+        sys.exit(2)
+    return container.skill_loader
 
 
 def skill_list_command(
@@ -40,30 +72,11 @@ def skill_list_command(
     Requires ``config.skills.enabled: true``. Exits non-zero with an
     explanatory error otherwise.
     """
-    # Import here (not at module top) because SkillLoader lives in the
-    # infrastructure layer and the CLI adapter should stay import-light.
-    from ...infrastructure.skills.skill_loader import SkillLoader
-
-    if skills_dir_override is not None:
-        # --skills-dir on the command line bypasses config gating.
-        # The operator explicitly pointed at a directory; honor it even
-        # if config.skills.enabled=false. Useful for one-off inspection
-        # of a skill library without editing config.
-        skill_loader = SkillLoader(directory=skills_dir_override.expanduser())
-    else:
-        container = DIContainer.create(
-            config_path=str(config_path) if config_path else None,
-        )
-        if container.skill_loader is None:
-            console.print("[red]Skills are not enabled in the config.[/red]")
-            console.print(
-                "Set [bold]config.skills.enabled: true[/bold] and configure "
-                "[bold]config.skills.directory[/bold] to point at your skills folder, "
-                "set the [bold]FALCONEYE_SKILLS_DIR[/bold] environment variable, or "
-                "pass [bold]--skills-dir[/bold] on this command."
-            )
-            sys.exit(2)
-        skill_loader = container.skill_loader
+    skill_loader = _resolve_skill_loader(
+        config_path=config_path,
+        skills_dir_override=skills_dir_override,
+        console=console,
+    )
 
     skill_dir = skill_loader.directory
     if not skill_dir.exists():
@@ -101,11 +114,14 @@ def skill_list_command(
     table.add_column("Runnable")
 
     for s in skills:
-        runnable_marker = (
-            "[green]yes[/green]"
-            if s.is_runnable_today
-            else "[yellow]deferred[/yellow]"
-        )
+        # A scan skill without Step 1 patterns is rejected by `skill
+        # run` and skipped by run-all, so it isn't "yes" either.
+        if not s.is_runnable_today:
+            runnable_marker = "[yellow]deferred[/yellow]"
+        elif not s.discovery_patterns:
+            runnable_marker = "[yellow]needs patterns[/yellow]"
+        else:
+            runnable_marker = "[green]yes[/green]"
         # Text cells: frontmatter values are operator-authored and must
         # not be parsed as Rich markup.
         table.add_row(
@@ -125,6 +141,12 @@ def skill_list_command(
             "\n[dim]Skills marked [/dim][yellow]deferred[/yellow][dim] "
             "have function=verify or function=triage; they will run in "
             "later pipeline phases, not via `skill run`.[/dim]"
+        )
+    if any(s.is_runnable_today and not s.discovery_patterns for s in skills):
+        console.print(
+            "[dim]Skills marked [/dim][yellow]needs patterns[/yellow][dim] "
+            "have no Step 1 grep patterns; `skill run` rejects them until "
+            "LLM-only execution lands. `falconeye skill lint` shows why.[/dim]"
         )
 
     if show_patterns:
@@ -159,6 +181,75 @@ def _print_pattern_details(skills, console: Console) -> None:
             console.print(Text(f"  [{i}] {desc}"))
             console.print(Text.assemble("      ", ("ext:", "dim"), " ", ext_str))
             console.print(Text.assemble("      ", ("regex:", "dim"), " ", regex_display))
+
+
+def skill_lint_command(
+    *,
+    config_path: Optional[Path],
+    console: Console,
+    skills_dir_override: Optional[Path] = None,
+) -> None:
+    """Report problems in skill files without running them.
+
+    Lists, per skill, everything the tolerant loader and grep runner
+    would otherwise skip silently: regexes Python can't compile or
+    reads differently from grep -E, grep commands the loader ignores,
+    broken frontmatter, duplicate names, and skills that can't run
+    yet. Exits 1 when any error is found, so it can gate a skills
+    repository in CI.
+    """
+    from ...infrastructure.skills.skill_linter import (
+        LINT_ERROR,
+        LINT_INFO,
+        LINT_WARNING,
+        lint_skills,
+    )
+
+    skill_loader = _resolve_skill_loader(
+        config_path=config_path,
+        skills_dir_override=skills_dir_override,
+        console=console,
+    )
+    skill_dir = skill_loader.directory
+    if not skill_dir.exists():
+        console.print(Text.assemble(
+            ("Skills directory does not exist:", "red"), f" {skill_dir}",
+        ))
+        sys.exit(2)
+    skills = skill_loader.load_all()
+    if not skills:
+        console.print(Text.assemble(("No skills found in", "yellow"), f" {skill_dir}"))
+        return
+
+    issues = lint_skills(skills)
+    by_skill: dict = {}
+    for issue in issues:
+        by_skill.setdefault(issue.skill, []).append(issue)
+
+    styles = {LINT_ERROR: "red", LINT_WARNING: "yellow", LINT_INFO: "dim"}
+    console.print(Text.assemble(
+        (f"Linting {len(skills)} skill{'s' if len(skills) != 1 else ''} in", "cyan"),
+        f" {skill_dir}",
+    ))
+    for name in sorted({s.name for s in skills}):
+        console.print(Text(f"\n{name}", style="bold"))
+        found = by_skill.get(name)
+        if not found:
+            console.print(Text("  ok", style="green"))
+            continue
+        for issue in found:
+            console.print(Text.assemble(
+                "  ", (f"{issue.level.upper():7}", styles[issue.level]),
+                " ", (issue.code, "cyan"), "  ", issue.message,
+            ))
+
+    counts = {level: sum(1 for i in issues if i.level == level) for level in styles}
+    console.print(Text(
+        f"\n{len(skills)} skills: {counts[LINT_ERROR]} error(s), "
+        f"{counts[LINT_WARNING]} warning(s), {counts[LINT_INFO]} info"
+    ))
+    if counts[LINT_ERROR]:
+        sys.exit(1)
 
 
 
@@ -196,25 +287,12 @@ def skill_run_command(
     # infrastructure, and the CLI adapter should not pull the whole
     # tree in at import time).
     from ...application.services.skill_runner_service import SkillRunnerService
-    from ...infrastructure.skills.skill_loader import SkillLoader
 
-    # -- Resolve the skill loader (config or override) --
-    if skills_dir_override is not None:
-        skill_loader = SkillLoader(directory=skills_dir_override.expanduser())
-    else:
-        container = DIContainer.create(
-            config_path=str(config_path) if config_path else None,
-        )
-        if container.skill_loader is None:
-            console.print("[red]Skills are not enabled in the config.[/red]")
-            console.print(
-                "Set [bold]config.skills.enabled: true[/bold] and configure "
-                "[bold]config.skills.directory[/bold], set the "
-                "[bold]FALCONEYE_SKILLS_DIR[/bold] environment variable, or "
-                "pass [bold]--skills-dir[/bold] on this command."
-            )
-            _sys.exit(2)
-        skill_loader = container.skill_loader
+    skill_loader = _resolve_skill_loader(
+        config_path=config_path,
+        skills_dir_override=skills_dir_override,
+        console=console,
+    )
 
     # -- Load the skill by name --
     all_skills = skill_loader.load_all()
@@ -439,25 +517,12 @@ def skill_run_all_command(
         BATCH_STATUS_SKIPPED_NOT_SCAN,
         SkillRunnerService,
     )
-    from ...infrastructure.skills.skill_loader import SkillLoader
 
-    # Resolve skill loader (config gating vs. override)
-    if skills_dir_override is not None:
-        skill_loader = SkillLoader(directory=skills_dir_override.expanduser())
-    else:
-        container = DIContainer.create(
-            config_path=str(config_path) if config_path else None,
-        )
-        if container.skill_loader is None:
-            console.print("[red]Skills are not enabled in the config.[/red]")
-            console.print(
-                "Set [bold]config.skills.enabled: true[/bold] and configure "
-                "[bold]config.skills.directory[/bold], set the "
-                "[bold]FALCONEYE_SKILLS_DIR[/bold] environment variable, or "
-                "pass [bold]--skills-dir[/bold] on this command."
-            )
-            _sys.exit(2)
-        skill_loader = container.skill_loader
+    skill_loader = _resolve_skill_loader(
+        config_path=config_path,
+        skills_dir_override=skills_dir_override,
+        console=console,
+    )
 
     all_skills = skill_loader.load_all()
     if not all_skills:

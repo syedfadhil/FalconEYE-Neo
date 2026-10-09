@@ -1,5 +1,6 @@
 """Shared fixtures for FalconEYE tests."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -79,3 +80,33 @@ def empty_review():
     )
     review.complete()
     return review
+
+
+@pytest.fixture
+def operator_skill():
+    """Return a lookup for operator-authored skill files.
+
+    ``operator_skill("injection-prevention")`` returns the path of that
+    skill, or skips the calling test when it isn't available. Skills
+    are operator-owned and not shipped with FalconEYE, so these
+    regression tests run only where the library exists:
+    FALCONEYE_TEST_SKILLS_DIR (holding ``<name>.md`` or
+    ``<name>/SKILL.md``) is checked first, then the original sandbox
+    upload path.
+    """
+    def lookup(name: str) -> Path:
+        candidates = []
+        env_dir = os.environ.get("FALCONEYE_TEST_SKILLS_DIR", "").strip()
+        if env_dir:
+            root = Path(env_dir).expanduser()
+            candidates += [root / f"{name}.md", root / name / "SKILL.md"]
+        candidates.append(Path("/mnt/user-data/uploads") / f"{name}.md")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        pytest.skip(
+            f"operator skill {name!r} not available "
+            "(set FALCONEYE_TEST_SKILLS_DIR to your skills folder)"
+        )
+
+    return lookup

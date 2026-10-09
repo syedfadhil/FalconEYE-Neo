@@ -18,6 +18,7 @@ from .commands import (
 from .commands_upgrade import upgrade_command
 from .commands_taint import taint_command
 from .commands_skill import (
+    skill_lint_command,
     skill_list_command,
     skill_run_all_command,
     skill_run_command,
@@ -764,6 +765,41 @@ def skill_list(
         config_path=config,
         console=console,
         show_patterns=show_patterns,
+        skills_dir_override=skills_dir,
+    )
+
+
+@skill_app.command(name="lint")
+def skill_lint(
+    skills_dir: Optional[Path] = typer.Option(
+        None,
+        "--skills-dir",
+        help="Override the skills directory (bypasses config gating)",
+        exists=False,
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config", "-c",
+        help="Path to config file",
+        exists=True,
+    ),
+):
+    """
+    Check skill files for problems without running them.
+
+    Reports what the loader would otherwise skip silently: discovery
+    regexes that Python can't compile or reads differently from
+    grep -E (e.g. BRE-style \\| alternation), Step 1 grep commands the
+    loader ignores, broken frontmatter, duplicate names, and skills
+    that can't run yet. Exits 1 if any error is found.
+
+    Usage:
+        falconeye skill lint
+        falconeye skill lint --skills-dir ~/skills
+    """
+    skill_lint_command(
+        config_path=config,
+        console=console,
         skills_dir_override=skills_dir,
     )
 

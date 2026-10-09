@@ -650,6 +650,19 @@ def test_cli_list_shows_all_skills(tmp_path):
     category: web-api-security
     function: scan
     ---
+
+    ## Step 1
+
+    ```bash
+    grep -rn -E "danger" --include="*.py" .
+    ```
+    """))
+    _write_skill(skills_dir, "llm1", textwrap.dedent("""\
+    ---
+    name: llm1
+    description: scan skill without Step 1 patterns
+    function: scan
+    ---
     """))
     _write_skill(skills_dir, "vfy1", textwrap.dedent("""\
     ---
@@ -666,8 +679,11 @@ def test_cli_list_shows_all_skills(tmp_path):
     out = buf.getvalue()
     assert "aud1" in out
     assert "vfy1" in out
-    # scan skill is runnable
+    # scan skill with patterns is runnable
     assert "yes" in out
+    # scan skill without patterns is rejected by `skill run`, so it
+    # must not claim "yes"
+    assert "needs patterns" in out
     # verify skill is deferred
     assert "deferred" in out
 
@@ -706,15 +722,13 @@ def test_cli_list_show_patterns_expands_details(tmp_path):
 
 
 @pytest.mark.unit
-def test_operator_uploaded_injection_prevention_extracts_patterns(tmp_path):
+def test_operator_uploaded_injection_prevention_extracts_patterns(tmp_path, operator_skill):
     """Real skill from operator uploads: injection-prevention.md.
 
     Verifies the loader handles em-dashes in headings, complex regexes
     with quotes-in-quotes, and multi-language --include globs.
     """
-    upload = Path("/mnt/user-data/uploads/injection-prevention.md")
-    if not upload.exists():
-        pytest.skip("operator skills not available in this environment")
+    upload = operator_skill("injection-prevention")
     (tmp_path / "injection-prevention").mkdir()
     (tmp_path / "injection-prevention" / "SKILL.md").write_text(
         upload.read_text(encoding="utf-8"), encoding="utf-8",
@@ -735,15 +749,13 @@ def test_operator_uploaded_injection_prevention_extracts_patterns(tmp_path):
 
 
 @pytest.mark.unit
-def test_operator_uploaded_input_validation_zero_patterns(tmp_path):
+def test_operator_uploaded_input_validation_zero_patterns(tmp_path, operator_skill):
     """input-validation.md has no grep commands in Step 1 (LLM-only skill).
 
     Confirms the loader accepts this shape and produces a runnable skill
     with zero patterns rather than failing to load.
     """
-    upload = Path("/mnt/user-data/uploads/input-validation.md")
-    if not upload.exists():
-        pytest.skip("operator skills not available in this environment")
+    upload = operator_skill("input-validation")
     (tmp_path / "input-validation").mkdir()
     (tmp_path / "input-validation" / "SKILL.md").write_text(
         upload.read_text(encoding="utf-8"), encoding="utf-8",
@@ -758,11 +770,9 @@ def test_operator_uploaded_input_validation_zero_patterns(tmp_path):
 
 
 @pytest.mark.unit
-def test_operator_uploaded_fp_check_marked_deferred(tmp_path):
+def test_operator_uploaded_fp_check_marked_deferred(tmp_path, operator_skill):
     """fp-check has function=verify -> deferred to Phase 3, not runnable now."""
-    upload = Path("/mnt/user-data/uploads/fp-check.md")
-    if not upload.exists():
-        pytest.skip("operator skills not available in this environment")
+    upload = operator_skill("fp-check")
     (tmp_path / "fp-check").mkdir()
     (tmp_path / "fp-check" / "SKILL.md").write_text(
         upload.read_text(encoding="utf-8"), encoding="utf-8",
@@ -773,10 +783,8 @@ def test_operator_uploaded_fp_check_marked_deferred(tmp_path):
 
 
 @pytest.mark.unit
-def test_operator_uploaded_triage_marked_deferred(tmp_path):
-    upload = Path("/mnt/user-data/uploads/triage.md")
-    if not upload.exists():
-        pytest.skip("operator skills not available in this environment")
+def test_operator_uploaded_triage_marked_deferred(tmp_path, operator_skill):
+    upload = operator_skill("triage")
     (tmp_path / "triage").mkdir()
     (tmp_path / "triage" / "SKILL.md").write_text(
         upload.read_text(encoding="utf-8"), encoding="utf-8",

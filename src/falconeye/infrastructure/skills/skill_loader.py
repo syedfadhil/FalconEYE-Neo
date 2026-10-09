@@ -56,8 +56,11 @@ _logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------
 
 
+# The closing fence may end the file: a frontmatter-only stub (a
+# verify/triage skill with no body yet) saved without a trailing
+# newline must not lose its metadata.
 _FRONTMATTER_RE = re.compile(
-    r"\A---\s*\n(.*?)\n---\s*\n(.*)\Z",
+    r"\A---\s*\n(.*?)\n---[ \t]*(?:\r?\n(.*))?\Z",
     re.DOTALL,
 )
 
@@ -71,7 +74,7 @@ def _parse_frontmatter(content: str) -> Tuple[dict, str]:
     match = _FRONTMATTER_RE.match(content)
     if not match:
         return {}, content
-    raw_yaml, body = match.group(1), match.group(2)
+    raw_yaml, body = match.group(1), match.group(2) or ""
     try:
         data = yaml.safe_load(raw_yaml) or {}
     except yaml.YAMLError as e:
@@ -382,7 +385,11 @@ class SkillLoader:
         module.
         """
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            # utf-8-sig drops a byte-order mark. Windows editors often
+            # save one, and a BOM before the opening "---" used to hide
+            # the whole frontmatter -- a function=verify skill then
+            # loaded as a runnable scan skill named after its file.
+            content = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError as e:
             _logger.warning("Cannot read skill file %s: %s", path, e)
             return None
