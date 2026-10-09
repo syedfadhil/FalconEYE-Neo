@@ -847,6 +847,15 @@ def skill_run(
             "Requires taint to be enabled for at least one language in config."
         ),
     ),
+    max_files: Optional[int] = typer.Option(
+        None,
+        "--max-files",
+        min=1,
+        help=(
+            "For a skill without Step 1 patterns: evaluate at most this many "
+            "files (one LLM call each). Default: config.skills.max_llm_only_files (50)."
+        ),
+    ),
 ):
     """
     Execute a skill against a workspace.
@@ -857,16 +866,21 @@ def skill_run(
     findings in SecurityFinding shape (compatible with taint-confirm,
     reporters, and the shape-tolerant JSON loader).
 
-    Requires a runnable skill (function=scan) with at least one
-    Step 1 discovery pattern. Skills with function=verify or
-    function=triage are rejected with a clear message pointing to
-    their respective pipeline stages.
+    A skill without Step 1 patterns is swept instead: every source file
+    of the enabled languages (or the files matching the skill's
+    `targets:` globs) gets one LLM call, up to --max-files. The file
+    count is printed before the first call.
+
+    Requires a runnable skill (function=scan). Skills with
+    function=verify or function=triage are rejected with a clear
+    message pointing to their respective pipeline stages.
 
     Usage:
         falconeye skill run injection-prevention Portal
         falconeye skill run injection-prevention Portal --output json --output-file inj.json
         falconeye skill run injection-prevention Portal --skills-dir ~/skills
         falconeye skill run injection-prevention Portal --confirm-taint
+        falconeye skill run input-validation Portal/src/Api --max-files 20
     """
     skill_run_command(
         skill_name=skill_name,
@@ -877,6 +891,7 @@ def skill_run(
         skills_dir_override=skills_dir,
         console=console,
         confirm_taint=confirm_taint,
+        max_files=max_files,
     )
 
 
@@ -927,6 +942,23 @@ def skill_run_all(
             "least one language in config."
         ),
     ),
+    include_llm_only: bool = typer.Option(
+        False,
+        "--include-llm-only",
+        help=(
+            "Also run skills without Step 1 patterns, as per-file sweeps "
+            "(one LLM call per file per skill, capped by --max-files)."
+        ),
+    ),
+    max_files: Optional[int] = typer.Option(
+        None,
+        "--max-files",
+        min=1,
+        help=(
+            "Per-skill file cap for --include-llm-only sweeps. "
+            "Default: config.skills.max_llm_only_files (50)."
+        ),
+    ),
 ):
     """
     Execute every runnable skill against a workspace.
@@ -936,7 +968,8 @@ def skill_run_all(
     pattern, runs each in sequence, and aggregates all findings
     into a single SecurityReview. Skipped and errored skills are
     surfaced in the batch summary so operators can see why they
-    didn\'t contribute.
+    didn\'t contribute. With --include-llm-only, skills without
+    patterns run too, each as a capped per-file sweep.
 
     When --dedupe is on (default), findings sharing (file, line,
     category) are collapsed to the highest-severity survivor. The
@@ -948,6 +981,7 @@ def skill_run_all(
         falconeye skill run-all Portal --output json --output-file all.json
         falconeye skill run-all Portal --no-dedupe
         falconeye skill run-all Portal --confirm-taint -o json --output-file all.json
+        falconeye skill run-all Portal --include-llm-only --max-files 25
     """
     skill_run_all_command(
         workspace=workspace,
@@ -958,6 +992,8 @@ def skill_run_all(
         dedupe=dedupe,
         console=console,
         confirm_taint=confirm_taint,
+        include_llm_only=include_llm_only,
+        max_files=max_files,
     )
 
 

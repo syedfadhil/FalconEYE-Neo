@@ -111,6 +111,7 @@ def lint_skill(skill: SkillDefinition) -> List[LintIssue]:
         + _check_metadata(skill, frontmatter)
         + _check_patterns(skill)
         + _check_commands(skill)
+        + _check_targets(skill, frontmatter)
     )
 
 
@@ -349,9 +350,43 @@ def _check_commands(skill: SkillDefinition) -> List[LintIssue]:
             "no 'Step 1' heading" if step1 is None
             else "Step 1 has no ```bash``` grep command the loader can use"
         )
+        scope = (
+            f"the files matching targets ({', '.join(skill.metadata.targets)})"
+            if skill.metadata.targets
+            else "every enabled-language source file"
+        )
         issues.append(LintIssue(
             skill.name, LINT_INFO, "llm-only",
-            f"no discovery patterns ({reason}): skill run rejects it and "
-            "run-all skips it until LLM-only execution (Phase 1c) lands.",
+            f"no discovery patterns ({reason}): skill run sweeps {scope}, "
+            "one LLM call each up to --max-files; run-all includes it only "
+            "with --include-llm-only.",
         ))
     return issues
+
+
+# --------------------------------------------------------------------
+# Sweep targets
+# --------------------------------------------------------------------
+
+
+def _check_targets(skill: SkillDefinition, frontmatter: dict) -> List[LintIssue]:
+    if "targets" not in frontmatter:
+        return []
+    raw = frontmatter["targets"]
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list) or not all(
+        isinstance(t, str) and t.strip() for t in entries
+    ):
+        return [LintIssue(
+            skill.name, LINT_WARNING, "targets-invalid",
+            "targets must be a filename glob or a list of them (e.g. "
+            "[package.json, '*.csproj']); non-string or empty entries are "
+            f"ignored, leaving {list(skill.metadata.targets) or 'none'}.",
+        )]
+    if skill.discovery_patterns:
+        return [LintIssue(
+            skill.name, LINT_INFO, "targets-ignored",
+            "targets only selects files for a sweep; this skill has "
+            "discovery patterns, so grep hits pick its files instead.",
+        )]
+    return []

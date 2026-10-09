@@ -111,7 +111,21 @@ def _metadata_from_frontmatter(
         function=_str_or_none(fm.get("function")),
         breadth=_str_or_none(fm.get("breadth")),
         status=_str_or_none(_nested_get(fm, "execution", "status")),
+        targets=_targets_from_frontmatter(fm.get("targets")),
     )
+
+
+def _targets_from_frontmatter(raw) -> Tuple[str, ...]:
+    """Normalize ``targets`` to a tuple of non-empty glob strings.
+
+    Accepts a single string or a list. Non-string list entries are
+    dropped (``skill lint`` reports them) rather than failing the load.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return ()
+    return tuple(t.strip() for t in raw if isinstance(t, str) and t.strip())
 
 
 def _str_or_none(v) -> Optional[str]:

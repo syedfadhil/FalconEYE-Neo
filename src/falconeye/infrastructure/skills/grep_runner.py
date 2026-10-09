@@ -72,6 +72,8 @@ class GrepRunner:
     DEFAULT_MAX_HITS_PER_PATTERN = 40
     DEFAULT_MAX_TOTAL_HITS = 200
     DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB
+    # Exposed so the LLM-only sweep skips exactly what discovery skips.
+    DEFAULT_SKIP_FRAGMENTS = _DEFAULT_SKIP_FRAGMENTS
 
     def __init__(
         self,

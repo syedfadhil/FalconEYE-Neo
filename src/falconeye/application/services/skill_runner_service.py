@@ -11,13 +11,13 @@ findings (JSON matching the shared schema), converts each into a
 Design notes
 ------------
 
-Skills without discovery patterns are rejected here with a clear
-error. Whole-workspace LLM-only skills (input-validation-style) need
-a different execution model -- they either iterate every relevant
-file (expensive) or ask the LLM to select files (fragile). Phase 1c
-will add that mode; this patch focuses on the discovery-driven path,
-which covers the two heaviest skills in the operator's library
-(injection-prevention, deserialization-xxe).
+Skills without discovery patterns (input-validation-style "locate and
+read" skills) run as a SWEEP: every candidate file -- the skill's
+``targets`` globs, or else the source files of the enabled languages
+-- gets one LLM call with no discovery hits, using the same per-file
+evaluator. The sweep is opt-in at the service boundary (callers pass
+``sweep_extensions``) and capped by ``max_sweep_files``; files over
+the cap are counted in the summary, never dropped silently.
 
 Batching is by-file, not by-hit. Sending each hit separately would
 multiply prompt tokens (each call would re-include the skill body).
@@ -38,7 +38,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 from uuid import uuid4
 
 from ...domain.models.security import (
@@ -48,8 +48,10 @@ from ...domain.models.security import (
     Severity,
 )
 from ...domain.models.skill import DiscoveryHit, SkillDefinition
+from ...domain.services.language_detector import LanguageDetector
 from ...domain.services.llm_service import LLMService
 from ...infrastructure.skills.grep_runner import GrepRunner
+from ...infrastructure.workspace_files import iter_workspace_files
 
 
 _logger = logging.getLogger(__name__)
@@ -80,6 +82,11 @@ class SkillRunSummary:
 
     Populated as the runner works; the CLI renders this before the
     per-finding output so the operator can see coverage at a glance.
+
+    ``mode`` is :data:`RUN_MODE_DISCOVERY` (grep hits picked the files)
+    or :data:`RUN_MODE_SWEEP` (no patterns; every candidate file was
+    evaluated). ``files_not_evaluated`` counts sweep candidates left
+    out by the file cap.
     """
     skill_name: str
     total_discovery_hits: int = 0
@@ -87,6 +94,28 @@ class SkillRunSummary:
     files_with_llm_errors: int = 0
     total_findings: int = 0
     outcomes: List[FileEvaluationOutcome] = field(default_factory=list)
+    mode: str = "discovery"
+    files_not_evaluated: int = 0
+
+
+RUN_MODE_DISCOVERY = "discovery"
+RUN_MODE_SWEEP = "sweep"
+
+#: Default per-skill file cap for sweeps; mirrors SkillsConfig.max_llm_only_files.
+DEFAULT_MAX_SWEEP_FILES = 50
+
+
+def sweep_extensions_for(languages: Iterable[str]) -> Set[str]:
+    """Source-file extensions of ``languages`` (unknown names ignored).
+
+    Uses the same language -> extension table as language detection,
+    so a sweep covers exactly the files FalconEYE treats as code in
+    those languages.
+    """
+    exts: Set[str] = set()
+    for lang in languages:
+        exts.update(LanguageDetector.LANGUAGE_EXTENSIONS.get(lang.strip().lower(), ()))
+    return exts
 
 
 # --------------------------------------------------------------------
@@ -234,9 +263,13 @@ def _build_user_prompt(
         f"{'  [' + h.pattern_description + ']' if h.pattern_description else ''}"
         for h in hits
     )
+    no_hits = (
+        "  (none) -- no discovery pre-filter; review the whole file "
+        "against the audit procedure"
+    )
     return (
         f"## File\n\n`{file_path}`\n\n"
-        f"## Discovery hits\n\n{hit_lines or '  (none)'}\n\n"
+        f"## Discovery hits\n\n{hit_lines or no_hits}\n\n"
         f"## Source (numbered)\n\n```\n{numbered}\n```\n"
     )
 
@@ -453,14 +486,19 @@ class SkillRunnerService:
         workspace: Path,
         max_hits_per_pattern: int = GrepRunner.DEFAULT_MAX_HITS_PER_PATTERN,
         max_total_hits: int = GrepRunner.DEFAULT_MAX_TOTAL_HITS,
+        sweep_extensions: Optional[Iterable[str]] = None,
+        max_sweep_files: int = DEFAULT_MAX_SWEEP_FILES,
     ) -> "tuple[SecurityReview, SkillRunSummary]":
         """Execute the skill and return findings + a diagnostic summary.
 
-        Raises :class:`ValueError` when the skill has no discovery
-        patterns (LLM-only skills are not supported in Phase 1b; see
-        the module docstring). All other errors during evaluation are
-        caught per-file and recorded in the summary rather than
-        propagated.
+        Skills with discovery patterns run discovery-driven, as before.
+        Skills without them are swept (see :meth:`sweep_candidates`)
+        when the caller passes ``sweep_extensions`` -- the source
+        extensions to cover when the skill declares no ``targets``.
+        Without it, a pattern-less skill raises :class:`ValueError`, so
+        existing callers never start a costly sweep by accident. All
+        errors during evaluation are caught per-file and recorded in
+        the summary rather than propagated.
         """
         if not skill.is_runnable_today:
             raise ValueError(
@@ -469,39 +507,60 @@ class SkillRunnerService:
                 "verify skills route to fp-check (Phase 3); triage skills "
                 "route to the triage stage (Phase 4)."
             )
-        if not skill.discovery_patterns:
+        if not skill.discovery_patterns and sweep_extensions is None:
             raise ValueError(
                 f"Skill '{skill.name}' has no Step 1 discovery patterns. "
-                "Whole-workspace LLM-only execution is deferred to "
-                "Phase 1c. Add at least one `grep -rn -E \"...\" "
-                "--include=\"*.<ext>\" .` command inside a "
-                "```bash``` block under Step 1."
+                "Run it as a per-file sweep (`skill run`, or `skill "
+                "run-all --include-llm-only`), or add at least one "
+                "`grep -rn -E \"...\" --include=\"*.<ext>\" .` command "
+                "inside a ```bash``` block under Step 1."
             )
 
-        # ---------- Discovery ----------
-        grep = GrepRunner(
-            workspace_root=workspace,
-            max_hits_per_pattern=max_hits_per_pattern,
-            max_total_hits=max_total_hits,
-        )
-        hits = grep.discover(skill.discovery_patterns)
+        if skill.discovery_patterns:
+            # ---------- Discovery ----------
+            grep = GrepRunner(
+                workspace_root=workspace,
+                max_hits_per_pattern=max_hits_per_pattern,
+                max_total_hits=max_total_hits,
+            )
+            hits = grep.discover(skill.discovery_patterns)
 
-        summary = SkillRunSummary(
-            skill_name=skill.name,
-            total_discovery_hits=len(hits),
-        )
+            summary = SkillRunSummary(
+                skill_name=skill.name,
+                total_discovery_hits=len(hits),
+            )
 
-        # Group by file
-        hits_by_file: Dict[str, List[DiscoveryHit]] = {}
-        for h in hits:
-            hits_by_file.setdefault(h.file_path, []).append(h)
+            # Group by file
+            hits_by_file: Dict[str, List[DiscoveryHit]] = {}
+            for h in hits:
+                hits_by_file.setdefault(h.file_path, []).append(h)
+            work = sorted(hits_by_file.items())
+        else:
+            # ---------- Sweep ----------
+            candidates = self.sweep_candidates(
+                skill=skill, workspace=workspace, extensions=sweep_extensions,
+            )
+            selected = candidates[:max(max_sweep_files, 0)]
+            summary = SkillRunSummary(
+                skill_name=skill.name,
+                mode=RUN_MODE_SWEEP,
+                files_not_evaluated=len(candidates) - len(selected),
+            )
+            if summary.files_not_evaluated:
+                _logger.warning(
+                    "Skill %s: sweep capped at %d of %d files; %d not evaluated "
+                    "(raise --max-files or narrow the workspace).",
+                    skill.name, len(selected), len(candidates),
+                    summary.files_not_evaluated,
+                )
+            work = [(str(p), []) for p in selected]
 
         # ---------- Per-file LLM evaluation ----------
         review = SecurityReview.create(
             codebase_path=str(workspace),
             language=(skill.metadata.category or "unknown"),
         )
-        for file_path, file_hits in sorted(hits_by_file.items()):
+        for file_path, file_hits in work:
             outcome = await self._evaluate_file(
                 skill=skill,
                 file_path=file_path,
@@ -523,12 +582,19 @@ class SkillRunnerService:
         skills: "List[SkillDefinition]",
         workspace: Path,
         dedupe: bool = True,
+        include_llm_only: bool = False,
+        sweep_extensions: Optional[Iterable[str]] = None,
+        max_sweep_files: int = DEFAULT_MAX_SWEEP_FILES,
     ) -> "tuple[SecurityReview, SkillBatchSummary]":
         """Run every runnable skill in ``skills`` against ``workspace``.
 
-        Skills that aren't runnable (function != scan, or no Step 1
-        discovery patterns) are recorded in the batch summary as
-        skipped rather than failing the whole batch. Skills that
+        Skills that aren't runnable (function != scan) are recorded in
+        the batch summary as skipped rather than failing the whole
+        batch. Skills without Step 1 discovery patterns are skipped
+        too unless ``include_llm_only`` is set (with
+        ``sweep_extensions``), in which case each is swept file by
+        file, up to ``max_sweep_files`` files per skill. A sweep is one
+        LLM call per file per skill, so it's opt-in here. Skills that
         raise unexpectedly during execution are recorded as errored.
         Both cases keep the batch flowing so a broken skill doesn't
         block the operator from seeing what everything else found.
@@ -565,13 +631,14 @@ class SkillRunnerService:
                 batch.skills_skipped += 1
                 continue
 
-            if not skill.discovery_patterns:
+            sweep = not skill.discovery_patterns
+            if sweep and not (include_llm_only and sweep_extensions is not None):
                 batch.outcomes.append(SkillBatchOutcome(
                     skill_name=skill.name,
                     status=BATCH_STATUS_SKIPPED_NO_PATTERNS,
                     reason=(
-                        "no Step 1 discovery patterns; whole-workspace "
-                        "LLM-only execution is Phase 1c work."
+                        "no Step 1 discovery patterns; LLM-only skills are "
+                        "swept file by file only with --include-llm-only."
                     ),
                 ))
                 batch.skills_skipped += 1
@@ -580,6 +647,8 @@ class SkillRunnerService:
             try:
                 sub_review, sub_summary = await self.run(
                     skill=skill, workspace=workspace,
+                    sweep_extensions=sweep_extensions if sweep else None,
+                    max_sweep_files=max_sweep_files,
                 )
             except Exception as e:
                 _logger.warning(
@@ -618,6 +687,31 @@ class SkillRunnerService:
 
         review.complete()
         return review, batch
+
+    def sweep_candidates(
+        self,
+        *,
+        skill: SkillDefinition,
+        workspace: Path,
+        extensions: Iterable[str],
+    ) -> List[Path]:
+        """Files a sweep of ``skill`` would evaluate, in evaluation order.
+
+        A skill's ``targets`` globs, when present, replace
+        ``extensions`` entirely -- that is how a dependency-audit skill
+        reaches ``package.json`` / ``*.csproj`` without being run over
+        every source file. Skips the same directories and oversized
+        files as discovery. Sorted, so the first N files under a cap
+        are the same on every run and OS.
+        """
+        targets = skill.metadata.targets
+        return list(iter_workspace_files(
+            workspace,
+            extensions=() if targets else extensions,
+            name_patterns=targets,
+            skip_fragments=GrepRunner.DEFAULT_SKIP_FRAGMENTS,
+            max_file_bytes=GrepRunner.DEFAULT_MAX_FILE_BYTES,
+        ))
 
     # ---- internals ----
 

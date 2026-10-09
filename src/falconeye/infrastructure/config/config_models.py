@@ -576,6 +576,16 @@ class SkillsConfig(BaseModel):
         le=2000,
         description="Total hit cap across all discovery patterns per run"
     )
+    max_llm_only_files: int = Field(
+        default=50,
+        ge=1,
+        le=2000,
+        description=(
+            "Per-skill cap on files evaluated when sweeping a skill that has no "
+            "Step 1 discovery patterns (one LLM call per file). Overridable with "
+            "--max-files on `skill run` / `skill run-all`."
+        ),
+    )
 
 
 class FalconEyeConfig(BaseModel):

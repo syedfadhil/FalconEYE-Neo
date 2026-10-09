@@ -231,3 +231,5 @@ logging:
 #   enabled: true
 #   directory: ~/.falconeye/skills   # or an absolute path
 #   max_discovery_hits: 200          # cap across all discovery patterns per run
+#   max_llm_only_files: 50           # per-skill file cap when sweeping a skill
+#                                    # with no Step 1 patterns (1 LLM call/file)

@@ -49,6 +49,11 @@ class SkillMetadata:
     function: Optional[str] = None
     breadth: Optional[str] = None  # broad | targeted
     status: Optional[str] = None   # ga | experimental | wip | n/a
+    # FalconEYE-specific: filename globs selecting the files an
+    # LLM-only skill sweeps (e.g. ("package.json", "*.csproj") for a
+    # dependency audit). Empty means "source files of every enabled
+    # language". Ignored when the skill has discovery patterns.
+    targets: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -94,8 +99,8 @@ class SkillDefinition:
 
     ``discovery_patterns`` may be empty for skills that don't ship
     grep patterns (e.g. skills that rely entirely on LLM reasoning
-    over the whole workspace). In that case the runner falls back to
-    file-level analysis.
+    over the whole workspace). The runner then sweeps: one LLM call
+    per candidate file (see ``metadata.targets``), capped per run.
     """
     metadata: SkillMetadata
     source_path: Path

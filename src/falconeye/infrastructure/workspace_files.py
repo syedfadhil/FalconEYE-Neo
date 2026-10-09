@@ -25,6 +25,7 @@ and operating systems. Symlinked directories are not followed.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -36,15 +37,21 @@ def iter_workspace_files(
     extensions: Iterable[str],
     skip_fragments: Iterable[str] = (),
     max_file_bytes: Optional[int] = None,
+    name_patterns: Iterable[str] = (),
 ) -> Iterator[Path]:
     """Yield files under ``root`` whose suffix is in ``extensions``.
 
     ``extensions`` are compared case-insensitively, with or without a
-    leading dot. ``skip_fragments`` use the existing ``"/name/"``
-    convention (multi-segment fragments like ``"/a/b/"`` work too) and
-    are matched against each directory's path relative to ``root``, so
-    the location of the workspace itself never causes a skip. Files
-    larger than ``max_file_bytes`` (when given) are skipped.
+    leading dot. ``name_patterns`` are shell-style globs matched
+    case-insensitively against the file NAME (``package.json``,
+    ``*.csproj``, ``requirements*.txt``); a file is yielded when it
+    matches either an extension or a name pattern, so manifests with
+    no useful extension can be selected. ``skip_fragments`` use the
+    existing ``"/name/"`` convention (multi-segment fragments like
+    ``"/a/b/"`` work too) and are matched against each directory's
+    path relative to ``root``, so the location of the workspace itself
+    never causes a skip. Files larger than ``max_file_bytes`` (when
+    given) are skipped.
     """
     root = Path(root)
     exts = {
@@ -52,7 +59,8 @@ def iter_workspace_files(
         for e in (x.strip().lower() for x in extensions)
         if e
     }
-    if not exts or not root.is_dir():
+    globs = tuple(p.strip().lower() for p in name_patterns if p.strip())
+    if (not exts and not globs) or not root.is_dir():
         return
     fragments = tuple(skip_fragments)
 
@@ -65,7 +73,10 @@ def iter_workspace_files(
             if not any(frag in f"{base}{d}/" for frag in fragments)
         )
         for name in sorted(filenames):
-            if os.path.splitext(name)[1].lower() not in exts:
+            lowered = name.lower()
+            if os.path.splitext(lowered)[1] not in exts and not any(
+                fnmatch.fnmatchcase(lowered, g) for g in globs
+            ):
                 continue
             path = Path(dirpath) / name
             if max_file_bytes is not None:

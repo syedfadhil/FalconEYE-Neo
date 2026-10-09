@@ -681,9 +681,9 @@ def test_cli_list_shows_all_skills(tmp_path):
     assert "vfy1" in out
     # scan skill with patterns is runnable
     assert "yes" in out
-    # scan skill without patterns is rejected by `skill run`, so it
-    # must not claim "yes"
-    assert "needs patterns" in out
+    # scan skill without patterns runs as a per-file sweep, so it
+    # must not claim plain "yes"
+    assert "│ sweep" in out
     # verify skill is deferred
     assert "deferred" in out
 

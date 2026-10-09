@@ -114,12 +114,12 @@ def skill_list_command(
     table.add_column("Runnable")
 
     for s in skills:
-        # A scan skill without Step 1 patterns is rejected by `skill
-        # run` and skipped by run-all, so it isn't "yes" either.
+        # A scan skill without Step 1 patterns runs as a per-file sweep
+        # (one LLM call per file), which costs differently from "yes".
         if not s.is_runnable_today:
             runnable_marker = "[yellow]deferred[/yellow]"
         elif not s.discovery_patterns:
-            runnable_marker = "[yellow]needs patterns[/yellow]"
+            runnable_marker = "[yellow]sweep[/yellow]"
         else:
             runnable_marker = "[green]yes[/green]"
         # Text cells: frontmatter values are operator-authored and must
@@ -144,9 +144,10 @@ def skill_list_command(
         )
     if any(s.is_runnable_today and not s.discovery_patterns for s in skills):
         console.print(
-            "[dim]Skills marked [/dim][yellow]needs patterns[/yellow][dim] "
-            "have no Step 1 grep patterns; `skill run` rejects them until "
-            "LLM-only execution lands. `falconeye skill lint` shows why.[/dim]"
+            "[dim]Skills marked [/dim][yellow]sweep[/yellow][dim] have no "
+            "Step 1 grep patterns: `skill run` evaluates each candidate file "
+            "(one LLM call per file, capped by --max-files), and `skill "
+            "run-all` includes them only with --include-llm-only.[/dim]"
         )
 
     if show_patterns:
@@ -263,13 +264,17 @@ def skill_run_command(
     skills_dir_override: Optional[Path],
     console: Console,
     confirm_taint: bool = False,
+    max_files: Optional[int] = None,
 ) -> None:
     """Execute a single skill against a workspace.
 
     Loads the skill by name (matching ``SkillDefinition.name``), runs
     the Step 1 grep discovery, invokes the LLM once per file with
     discovery hits, and emits a SecurityReview with the LLM's
-    findings converted to SecurityFinding shape.
+    findings converted to SecurityFinding shape. A skill without
+    discovery patterns is swept instead: one LLM call per candidate
+    file, up to ``max_files`` (default ``config.skills.max_llm_only_files``),
+    with the file count printed before any call is made.
 
     Same output modes as ``skill list`` -- console table or JSON. When
     ``--output-file`` is set, JSON is written to disk; otherwise
@@ -307,24 +312,14 @@ def skill_run_command(
     # -- Gate on runnability early with an actionable message --
     if not skill.is_runnable_today:
         fn = skill.metadata.function or "unknown"
-        console.print(
-            f"[yellow]Skill '{skill_name}' has function=[bold]{fn}[/bold], "
-            "which is not executable via [bold]skill run[/bold].[/yellow]"
-        )
+        console.print(Text(
+            f"Skill '{skill_name}' has function={fn}, which is not "
+            "executable via skill run.",
+            style="yellow",
+        ))
         console.print(
             "  verify skills route through fp-check (Phase 3, pending).\n"
             "  triage skills route through the triage stage (Phase 4, pending)."
-        )
-        _sys.exit(2)
-
-    if not skill.discovery_patterns:
-        console.print(
-            f"[yellow]Skill '{skill_name}' has no Step 1 discovery patterns.[/yellow]"
-        )
-        console.print(
-            "Whole-workspace LLM-only execution is deferred to Phase 1c. "
-            "Add at least one grep command inside a bash code block under "
-            "the Step 1 heading."
         )
         _sys.exit(2)
 
@@ -345,20 +340,44 @@ def skill_run_command(
         _sys.exit(2)
 
     runner = SkillRunnerService(llm_service=llm_service)
+    sweep_exts, sweep_cap = _sweep_settings(container, max_files)
 
     # -- Run --
-    console.print(
-        f"[cyan]Running skill[/cyan] [bold]{skill.name}[/bold] "
-        f"against [cyan]{workspace}[/cyan]"
-    )
-    console.print(
-        f"[dim]{len(skill.discovery_patterns)} discovery pattern"
-        f"{'s' if len(skill.discovery_patterns) != 1 else ''}"
-        f", category={skill.metadata.category or 'unknown'}[/dim]"
-    )
+    console.print(Text.assemble(
+        ("Running skill", "cyan"), " ", (skill.name, "bold"), " against ",
+        (str(workspace), "cyan"),
+    ))
+    if skill.discovery_patterns:
+        n = len(skill.discovery_patterns)
+        console.print(Text(
+            f"{n} discovery pattern{'s' if n != 1 else ''}, "
+            f"category={skill.metadata.category or 'unknown'}",
+            style="dim",
+        ))
+    else:
+        # A sweep is one LLM call per file: say how many before any
+        # call is made, so an oversized workspace can be aborted.
+        candidates = runner.sweep_candidates(
+            skill=skill, workspace=workspace, extensions=sweep_exts,
+        )
+        selector = (
+            f"targets {', '.join(skill.metadata.targets)}"
+            if skill.metadata.targets else "enabled-language source files"
+        )
+        console.print(Text(
+            f"LLM-only skill: evaluating {min(len(candidates), sweep_cap)} of "
+            f"{len(candidates)} files ({selector}; one LLM call each, "
+            f"--max-files {sweep_cap})",
+            style="yellow",
+        ))
 
     try:
-        review, summary = asyncio.run(runner.run(skill=skill, workspace=workspace))
+        review, summary = asyncio.run(runner.run(
+            skill=skill,
+            workspace=workspace,
+            sweep_extensions=sweep_exts,
+            max_sweep_files=sweep_cap,
+        ))
     except ValueError as e:
         # Runner rejects unrunnable skills with ValueError -- we
         # pre-checked above but the runner is defensive too.
@@ -420,15 +439,58 @@ def _confirm_findings(
     )
 
 
+def _sweep_settings(container, max_files: Optional[int]):
+    """Return ``(extensions, file_cap)`` for sweeping LLM-only skills.
+
+    Extensions cover the source files of ``config.languages.enabled``
+    (every known language if the config doesn't say). The cap is
+    ``--max-files`` if given, else ``config.skills.max_llm_only_files``.
+    """
+    from ...application.services.skill_runner_service import (
+        DEFAULT_MAX_SWEEP_FILES,
+        sweep_extensions_for,
+    )
+    from ...domain.services.language_detector import LanguageDetector
+
+    config = getattr(container, "config", None)
+    enabled = getattr(getattr(config, "languages", None), "enabled", None)
+    if enabled is None:
+        enabled = list(LanguageDetector.LANGUAGE_EXTENSIONS)
+    if max_files is None:
+        max_files = getattr(
+            getattr(config, "skills", None), "max_llm_only_files",
+            DEFAULT_MAX_SWEEP_FILES,
+        )
+    return sweep_extensions_for(enabled), max_files
+
+
 def _print_run_summary(console: Console, summary) -> None:
     """One-line-per-file diagnostic + total, then blank line."""
+    if summary.mode == "sweep":
+        capped = (
+            f", {summary.files_not_evaluated} over the --max-files cap"
+            if summary.files_not_evaluated else ""
+        )
+        done = summary.files_evaluated
+        scope = f"sweep: {done} file{'s' if done != 1 else ''} evaluated{capped}"
+    else:
+        scope = (
+            f"{summary.total_discovery_hits} discovery hits, "
+            f"{summary.files_evaluated} files evaluated"
+        )
     console.print(
         f"\n[bold]Skill run summary[/bold]  "
-        f"[dim]({summary.total_discovery_hits} discovery hits, "
-        f"{summary.files_evaluated} files evaluated, "
+        f"[dim]({scope}, "
         f"{summary.files_with_llm_errors} with LLM errors, "
         f"{summary.total_findings} findings)[/dim]"
     )
+    if summary.files_not_evaluated:
+        console.print(
+            f"[yellow]{summary.files_not_evaluated} file"
+            f"{'s' if summary.files_not_evaluated != 1 else ''} not evaluated "
+            "(over the --max-files cap); raise --max-files or point the run "
+            "at a subdirectory.[/yellow]"
+        )
     if summary.files_with_llm_errors:
         console.print("[yellow]Files with errors:[/yellow]")
         for o in summary.outcomes:
@@ -489,15 +551,18 @@ def skill_run_all_command(
     dedupe: bool,
     console: Console,
     confirm_taint: bool = False,
+    include_llm_only: bool = False,
+    max_files: Optional[int] = None,
 ) -> None:
     """Execute every runnable skill against a workspace.
 
     Loads all skills from the configured skills directory (respects
     ``--skills-dir``), filters out non-runnable ones (function=verify /
-    triage, or missing Step 1 discovery patterns), invokes each
-    remaining skill via ``SkillRunnerService.run_all``, aggregates the
-    findings into a single ``SecurityReview``, and optionally
-    deduplicates.
+    triage, and -- unless ``include_llm_only`` -- skills without Step 1
+    discovery patterns), invokes each remaining skill via
+    ``SkillRunnerService.run_all``, aggregates the findings into a
+    single ``SecurityReview``, and optionally deduplicates. Included
+    LLM-only skills are swept, up to ``max_files`` files each.
 
     Skipped skills are surfaced in the summary with the reason so the
     operator can see why (and fix the skill file if the skip was
@@ -549,18 +614,39 @@ def skill_run_all_command(
         _sys.exit(2)
 
     # Preview: what will run, what will skip
-    runnable = [s for s in all_skills if s.is_runnable_today and s.discovery_patterns]
-    skipped_preview = len(all_skills) - len(runnable)
-    console.print(
-        f"[cyan]Running {len(runnable)} of {len(all_skills)} skills[/cyan] "
-        f"against [cyan]{workspace}[/cyan]"
-        + (f"  [dim]({skipped_preview} skipped)[/dim]" if skipped_preview else "")
-    )
+    scan_skills = [s for s in all_skills if s.is_runnable_today]
+    llm_only = [s for s in scan_skills if not s.discovery_patterns]
+    runnable = len(scan_skills) - (0 if include_llm_only else len(llm_only))
+    skipped_preview = len(all_skills) - runnable
+    console.print(Text.assemble(
+        (f"Running {runnable} of {len(all_skills)} skills", "cyan"),
+        " against ", (str(workspace), "cyan"),
+        (f"  ({skipped_preview} skipped)", "dim") if skipped_preview else "",
+    ))
+    sweep_exts, sweep_cap = _sweep_settings(container, max_files)
+    if llm_only and include_llm_only:
+        console.print(Text(
+            f"{len(llm_only)} LLM-only skill{'s' if len(llm_only) != 1 else ''} "
+            f"swept file by file: up to {sweep_cap} LLM calls each "
+            "(--max-files).",
+            style="yellow",
+        ))
+    elif llm_only:
+        console.print(Text(
+            f"{len(llm_only)} LLM-only skill{'s' if len(llm_only) != 1 else ''} "
+            "skipped; pass --include-llm-only to sweep them file by file.",
+            style="dim",
+        ))
 
     runner = SkillRunnerService(llm_service=llm_service)
-    review, batch = asyncio.run(
-        runner.run_all(skills=all_skills, workspace=workspace, dedupe=dedupe)
-    )
+    review, batch = asyncio.run(runner.run_all(
+        skills=all_skills,
+        workspace=workspace,
+        dedupe=dedupe,
+        include_llm_only=include_llm_only,
+        sweep_extensions=sweep_exts,
+        max_sweep_files=sweep_cap,
+    ))
 
     # Per-skill summary table
     _print_batch_summary(console, batch, dedupe=dedupe)
@@ -603,9 +689,18 @@ def _print_batch_summary(console: Console, batch, *, dedupe: bool) -> None:
             n = o.summary.total_findings
             errs = o.summary.files_with_llm_errors
             err_str = (f"  {errs} error{'s' if errs != 1 else ''}", "red") if errs else ""
+            sweep_str = ""
+            if o.summary.mode == "sweep":
+                over = o.summary.files_not_evaluated
+                done = o.summary.files_evaluated
+                sweep_str = (
+                    f"  (sweep: {done} file{'s' if done != 1 else ''}"
+                    + (f", {over} over cap" if over else "") + ")",
+                    "dim",
+                )
             console.print(Text.assemble(
                 "  ", ("RAN", "green"), "      ", name, ": ",
-                f"{n} finding{'s' if n != 1 else ''}", err_str,
+                f"{n} finding{'s' if n != 1 else ''}", err_str, sweep_str,
             ))
         elif o.status == BATCH_STATUS_SKIPPED_NOT_SCAN:
             console.print(Text.assemble(
