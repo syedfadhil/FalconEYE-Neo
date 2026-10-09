@@ -75,7 +75,10 @@ class JSONFormatter(logging.Formatter):
                 "traceback": self.formatException(record.exc_info)
             }
 
-        return json.dumps(log_data)
+        # default=str: an extra field holding a Path, enum or other
+        # non-JSON value must not turn into a "--- Logging error ---"
+        # traceback on stderr.
+        return json.dumps(log_data, default=str)
 
 
 class HumanReadableFormatter(logging.Formatter):
@@ -136,43 +139,84 @@ class FalconEyeLogger:
             retention_days: Days to retain logs (default: 30)
         """
         self.logger = logging.getLogger("falconeye")
-        self.logger.setLevel(getattr(logging, level.upper()))
         self.logger.propagate = False  # Don't propagate to root logger
+        self.configure(
+            level=level,
+            log_file=log_file,
+            console=console,
+            rotation=rotation,
+            retention_days=retention_days,
+        )
 
-        # Clear any existing handlers
-        self.logger.handlers.clear()
+    def configure(
+        self,
+        level: str = "INFO",
+        log_file: Optional[Path] = None,
+        console: bool = True,
+        rotation: str = "daily",
+        retention_days: int = 30,
+    ) -> None:
+        """(Re)build the handlers of the shared ``falconeye`` logger.
+
+        :meth:`get_instance` applies its arguments only when it creates
+        the singleton, and components create it early with defaults
+        (the LLM adapters do, inside ``DIContainer.create``). So the
+        CLI must call ``configure`` to apply ``config.logging.*``.
+        Previously it called ``get_instance(log_file=...)``, which was
+        silently ignored, and ``logging.file`` was never written.
+
+        The logger is never left without a handler. With the console
+        off and no file, a NullHandler keeps records from reaching
+        Python's last-resort handler, which used to print bare warnings
+        and tracebacks over the progress display.
+        """
+        log_level = getattr(logging, str(level).upper(), logging.INFO)
+        self.logger.setLevel(log_level)
+
+        for handler in list(self.logger.handlers):
+            self.logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
 
         # Add console handler
         if console:
             console_handler = logging.StreamHandler(sys.stderr)
-            console_handler.setLevel(getattr(logging, level.upper()))
+            console_handler.setLevel(log_level)
             console_handler.setFormatter(HumanReadableFormatter())
             self.logger.addHandler(console_handler)
 
         # Add file handler with rotation
         if log_file:
             log_file = Path(log_file)
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-
-            if rotation == "daily":
-                # TimedRotatingFileHandler for daily rotation
-                file_handler = logging.handlers.TimedRotatingFileHandler(
-                    filename=str(log_file),
-                    when='midnight',  # Rotate at midnight
-                    interval=1,       # Every day
-                    backupCount=retention_days,  # Keep last N days
-                    encoding='utf-8'
-                )
+            try:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                if rotation == "daily":
+                    # TimedRotatingFileHandler for daily rotation
+                    file_handler = logging.handlers.TimedRotatingFileHandler(
+                        filename=str(log_file),
+                        when='midnight',  # Rotate at midnight
+                        interval=1,       # Every day
+                        backupCount=retention_days,  # Keep last N days
+                        encoding='utf-8'
+                    )
+                else:
+                    # Regular FileHandler (no rotation)
+                    file_handler = logging.FileHandler(
+                        str(log_file),
+                        encoding='utf-8'
+                    )
+            except OSError as e:
+                # An unwritable log path must not stop a scan; say so once.
+                sys.stderr.write(f"FalconEYE: cannot write log file {log_file}: {e}\n")
             else:
-                # Regular FileHandler (no rotation)
-                file_handler = logging.FileHandler(
-                    str(log_file),
-                    encoding='utf-8'
-                )
+                file_handler.setLevel(logging.DEBUG)  # File gets everything
+                file_handler.setFormatter(JSONFormatter())
+                self.logger.addHandler(file_handler)
 
-            file_handler.setLevel(logging.DEBUG)  # File gets everything
-            file_handler.setFormatter(JSONFormatter())
-            self.logger.addHandler(file_handler)
+        if not self.logger.handlers:
+            self.logger.addHandler(logging.NullHandler())
 
     @classmethod
     def get_instance(
@@ -186,7 +230,9 @@ class FalconEyeLogger:
         """
         Get singleton instance of FalconEyeLogger.
 
-        Thread-safe singleton implementation.
+        Thread-safe singleton implementation. The arguments only take
+        effect when this call creates the instance; to change the
+        settings of an existing instance, call :meth:`configure`.
 
         Args:
             level: Log level

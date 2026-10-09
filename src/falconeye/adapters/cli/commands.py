@@ -176,30 +176,27 @@ def _format_finding_realtime(finding: SecurityFinding, console: Console, finding
 
 def _configure_logger_verbosity(container, verbose: bool) -> None:
     """
-    Configure logger console output based on verbose flag.
+    Apply config.logging and the verbose flag to the shared logger.
 
-    In non-verbose mode, removes console handlers so logs only go to file.
+    Logs always go to config.logging.file (when set). The console gets
+    them only in verbose mode, so normal runs show the progress display
+    and summaries, not log lines.
 
     Args:
         container: DI container with config
         verbose: Whether verbose mode is enabled
     """
-    import sys
-
-    logger = FalconEyeLogger.get_instance(
-        level=container.config.logging.level,
-        log_file=Path(container.config.logging.file),
-        console=True,  # Initialize with console enabled
-        rotation=container.config.logging.rotation,
-        retention_days=container.config.logging.retention_days,
+    cfg = container.config.logging
+    # configure(), not get_instance(...): the singleton already exists
+    # by now (the LLM adapters create it during DIContainer.create),
+    # and get_instance ignores arguments after the first call.
+    FalconEyeLogger.get_instance().configure(
+        level=cfg.level,
+        log_file=Path(cfg.file) if cfg.file else None,
+        console=verbose,
+        rotation=cfg.rotation,
+        retention_days=cfg.retention_days,
     )
-
-    # Disable console handlers if not verbose
-    if not verbose:
-        logger.logger.handlers = [
-            h for h in logger.logger.handlers
-            if not (isinstance(h, logging.StreamHandler) and h.stream == sys.stderr)
-        ]
 
 
 def _estimate_time_based_progress(elapsed_seconds: float) -> int:
