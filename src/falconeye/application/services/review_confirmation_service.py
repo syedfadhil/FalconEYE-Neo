@@ -36,6 +36,7 @@ from ...domain.services.entry_point_detector import EntryPointDetectorRegistry
 from ...domain.services.reachability_confirmer import ReachabilityConfirmer
 from ...infrastructure.taint_adapters.adapter_registry import AdapterRegistry
 from ...infrastructure.taint_index import TaintIndex
+from ...infrastructure.workspace_files import iter_workspace_files
 
 
 _logger = logging.getLogger(__name__)
@@ -267,9 +268,12 @@ class ReviewConfirmationService:
     def _walk_files(self, repo_path: Path, extensions: Set[str]):
         """Walk the repo yielding files whose suffix is in ``extensions``.
 
-        Uses the same default skip fragments as GrepRunner would --
+        Uses the same walker as GrepRunner and the taint scan --
         keeping the behavior consistent between the skill discovery
-        pass and confirmation.
+        pass and confirmation. Skip fragments are matched relative to
+        ``repo_path``: matched against the absolute path, a repo under
+        e.g. ``/build/`` produced an empty call graph and every
+        finding came back no_entry_points.
         """
         # Reuse the taint scan service's skip list; kept local to
         # avoid a cross-service import for one constant.
@@ -278,17 +282,11 @@ class ReviewConfirmationService:
             "/dist/", "/build/", "/target/", "/out/",
             "/__pycache__/", "/.venv/", "/venv/",
         )
-        if not repo_path.exists():
-            return
-        for candidate in repo_path.rglob("*"):
-            if not candidate.is_file():
-                continue
-            if candidate.suffix.lower() not in extensions:
-                continue
-            posix = candidate.as_posix()
-            if any(frag in posix for frag in skip_fragments):
-                continue
-            yield candidate
+        return iter_workspace_files(
+            repo_path,
+            extensions=extensions,
+            skip_fragments=skip_fragments,
+        )
 
 
 def _extension_of(file_path: str) -> str:

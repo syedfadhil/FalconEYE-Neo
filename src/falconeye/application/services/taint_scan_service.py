@@ -43,6 +43,7 @@ from ...domain.services.taint_verifier import (
     VERIFIER_VERDICT_UNCERTAIN,
     VerifierResult,
 )
+from ...infrastructure.workspace_files import iter_workspace_files
 
 if TYPE_CHECKING:
     from ...infrastructure.taint_adapters.adapter_registry import AdapterRegistry
@@ -256,27 +257,15 @@ class TaintScanService:
         """Yield files under ``root`` with an extension in ``extensions``.
 
         Applies simple default exclusions (VCS, package managers,
-        build outputs). Doesn't follow symlinks to avoid infinite
-        loops on pathological repos.
+        build outputs), matched relative to ``root`` so a repo that
+        lives under e.g. ``/build/`` is still scanned. Doesn't follow
+        symlinks to avoid infinite loops on pathological repos.
         """
-        if not root.exists():
-            return
-        if not extensions:
-            return
-        for candidate in root.rglob("*"):
-            if not candidate.is_file():
-                continue
-            if candidate.suffix.lower() not in extensions:
-                continue
-            posix = candidate.as_posix()
-            skip = False
-            for pat in _DEFAULT_SKIP_PATTERNS:
-                if pat in posix:
-                    skip = True
-                    break
-            if skip:
-                continue
-            yield candidate
+        return iter_workspace_files(
+            root,
+            extensions=extensions,
+            skip_fragments=_DEFAULT_SKIP_PATTERNS,
+        )
 
     def _language_for_extension(self, ext: str) -> Optional[str]:
         e = ext.lower()
