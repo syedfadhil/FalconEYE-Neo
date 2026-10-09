@@ -18,6 +18,7 @@ from ...infrastructure.di.container import DIContainer
 from ...infrastructure.config.config_loader import ConfigLoader
 from ...infrastructure.presentation.error_presenter import ErrorPresenter
 from ...infrastructure.logging import FalconEyeLogger
+from ...infrastructure.workspace_files import is_excluded
 from ...application.commands.index_codebase import IndexCodebaseCommand
 from ...application.commands.review_file import ReviewFileCommand
 from ..formatters.formatter_factory import FormatterFactory
@@ -274,8 +275,9 @@ def index_command(
         chunk_size = container.config.chunking.default_size
     if chunk_overlap is None:
         chunk_overlap = container.config.chunking.default_overlap
-    if exclude is None:
-        exclude = container.config.file_discovery.default_exclusions
+    # -e adds to the configured defaults rather than replacing them, so
+    # `-e "tests/*"` doesn't silently stop excluding node_modules.
+    exclude = _effective_exclusions(container, exclude)
 
     # Create command
     command = IndexCodebaseCommand(
@@ -317,18 +319,11 @@ def index_command(
             files.extend(list(path.rglob(f"*{ext}")))
     
     # Filter excluded patterns
-    filtered_files = []
-    for file_path in files:
-        should_exclude = False
-        relative_path = str(file_path.relative_to(path))
-        for pattern in exclude:
-            pattern_clean = pattern.replace("**", "").replace("*", "")
-            if pattern_clean in relative_path or pattern_clean in str(file_path):
-                should_exclude = True
-                break
-        if not should_exclude:
-            filtered_files.append(file_path)
-    
+    filtered_files = [
+        file_path for file_path in files
+        if not is_excluded(file_path.relative_to(path), exclude)
+    ]
+
     total_files = len(filtered_files)
     
     # Track progress
@@ -468,6 +463,31 @@ def _print_index_problems(console: Console, stats) -> None:
         console.print(Text(f"  ... and {hidden} more", style="dim"))
 
 
+def _effective_exclusions(container, extra) -> list:
+    """config.file_discovery.default_exclusions plus any CLI -e patterns."""
+    return list(container.config.file_discovery.default_exclusions) + list(extra or [])
+
+
+def _collect_review_files(path: Path, languages, extensions_by_language, exclude):
+    """Files a directory review analyzes, plus how many were excluded.
+
+    One walk over the tree for the union of the languages' extensions
+    (the prior implementation ran rglob() once per extension). Sorted,
+    so the checkpoint session ID is stable across runs regardless of
+    filesystem iteration order. Exclusions use the same matcher as the
+    index step.
+    """
+    wanted_exts = set()
+    for lang in languages:
+        wanted_exts.update(extensions_by_language.get(lang, []))
+    candidates = sorted({
+        p for p in path.rglob("*")
+        if p.is_file() and p.suffix in wanted_exts
+    })
+    files = [p for p in candidates if not is_excluded(p.relative_to(path), exclude)]
+    return files, len(candidates) - len(files)
+
+
 def review_command(
     path: Path,
     language: Optional[str],
@@ -484,6 +504,7 @@ def review_command(
     concurrency: Optional[int] = None,
     confirm_taint: bool = False,
     console: Console = None,
+    exclude: Optional[list[str]] = None,
 ):
     """
     Execute review command.
@@ -510,6 +531,9 @@ def review_command(
                        block. Requires taint to be enabled for at
                        least one language in config.
         console: Rich console
+        exclude: Extra exclusion patterns for directory reviews, added to
+                 config.file_discovery.default_exclusions (the same
+                 list the index step uses).
     """
     if verbose:
         console.print(Panel.fit(
@@ -558,23 +582,19 @@ def review_command(
         except Exception:
             all_languages = [language]
 
-        # Collect files across languages in a single walk. The prior
-        # implementation ran rglob() once per extension (10+ full-tree
-        # walks); we build one union of interesting suffixes and walk
-        # the tree exactly once.
-        wanted_exts = set()
-        for lang in all_languages:
-            wanted_exts.update(
-                container.language_detector.LANGUAGE_EXTENSIONS.get(lang, [])
-            )
-        files = [
-            p for p in path.rglob("*")
-            if p.is_file() and p.suffix in wanted_exts
-        ]
-
-        # Deterministic order so the checkpoint session ID is stable
-        # across runs regardless of filesystem iteration order.
-        files = sorted(set(files))
+        # Same exclusion list the index step uses, so `scan` doesn't send
+        # files to the LLM that it deliberately left out of the index.
+        files, excluded_count = _collect_review_files(
+            path,
+            all_languages,
+            container.language_detector.LANGUAGE_EXTENSIONS,
+            _effective_exclusions(container, exclude),
+        )
+        if excluded_count:
+            console.print(Text(
+                f"Skipping {excluded_count} file(s) matching exclusion patterns",
+                style="dim",
+            ))
 
         if not files:
             console.print(f"[yellow]No source files found in {path}[/yellow]")
@@ -1296,6 +1316,7 @@ def scan_command(
     resume: Optional[bool] = None,
     concurrency: Optional[int] = None,
     console: Console = None,
+    exclude: Optional[list[str]] = None,
 ):
     """
     Execute scan command (index + review).
@@ -1315,6 +1336,8 @@ def scan_command(
         resume: Resume review from checkpoint if one exists
         concurrency: Max files analyzed in parallel
         console: Rich console
+        exclude: Extra exclusion patterns, applied to both steps on top
+                 of config.file_discovery.default_exclusions
     """
     console.print(Panel.fit(
         "[bold]FalconEYE Full Scan[/bold]",
@@ -1328,7 +1351,7 @@ def scan_command(
         language=language,
         chunk_size=None,
         chunk_overlap=None,
-        exclude=None,
+        exclude=exclude,
         project_id=project_id,
         force_reindex=force_reindex,
         config_path=config_path,
@@ -1354,6 +1377,7 @@ def scan_command(
         resume=resume,
         concurrency=concurrency,
         console=console,
+        exclude=exclude,
     )
 
 

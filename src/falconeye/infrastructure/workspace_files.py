@@ -31,6 +31,29 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 
+def is_excluded(relative_path, patterns: Iterable[str]) -> bool:
+    """Whether a path matches any ``file_discovery`` exclusion pattern.
+
+    Keeps the established semantics -- wildcards are stripped and the
+    remainder must occur in the path, so ``*/node_modules/*`` means "a
+    node_modules directory anywhere" and ``*.min.js`` means "the path
+    contains .min.js" -- but matches against ``relative_path`` (relative
+    to the scanned root) in forward-slash form with a leading ``/``.
+    Before, the substring was looked for in the native path string and
+    in the absolute path, so on Windows (backslashes) every directory
+    pattern silently failed, and anywhere a repo living under e.g.
+    ``/build/`` had every file excluded. Patterns may use either
+    separator. A pattern that is only wildcards matches nothing (it used
+    to exclude everything).
+    """
+    rel = "/" + str(relative_path).replace("\\", "/").lstrip("/")
+    for pattern in patterns:
+        needle = pattern.replace("\\", "/").replace("**", "").replace("*", "")
+        if needle and needle in rel:
+            return True
+    return False
+
+
 def iter_workspace_files(
     root: Path,
     *,

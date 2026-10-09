@@ -21,6 +21,7 @@ from ...infrastructure.ast.ast_analyzer import EnhancedASTAnalyzer
 from ...infrastructure.logging import FalconEyeLogger
 from ...infrastructure.resilience import CircuitBreakerError
 from ...infrastructure.text import read_source_file
+from ...infrastructure.workspace_files import is_excluded
 
 
 #: Default number of chunks per embedding request. Small enough for
@@ -774,21 +775,11 @@ class IndexCodebaseHandler:
         # Remove duplicates (in case of overlapping extensions)
         files = list(set(files))
 
-        # Filter excluded patterns
-        filtered_files = []
-        for file_path in files:
-            should_exclude = False
-            relative_path = str(file_path.relative_to(root_path))
-
-            for pattern in excluded_patterns:
-                # Simple pattern matching (can be enhanced)
-                pattern_clean = pattern.replace("**", "").replace("*", "")
-                if pattern_clean in relative_path or pattern_clean in str(file_path):
-                    should_exclude = True
-                    break
-
-            if not should_exclude:
-                filtered_files.append(file_path)
+        # Filter excluded patterns (root-relative, separator-agnostic)
+        filtered_files = [
+            file_path for file_path in files
+            if not is_excluded(file_path.relative_to(root_path), excluded_patterns)
+        ]
 
         return filtered_files
 
@@ -962,24 +953,11 @@ class IndexCodebaseHandler:
         doc_files = list(set(doc_files))
 
         # Filter excluded patterns and non-files
-        filtered_docs = []
-        for doc_path in doc_files:
-            if not doc_path.is_file():
-                continue
-
-            should_exclude = False
-            relative_path = str(doc_path.relative_to(root_path))
-
-            for pattern in excluded_patterns:
-                pattern_clean = pattern.replace("**", "").replace("*", "")
-                if pattern_clean in relative_path or pattern_clean in str(doc_path):
-                    should_exclude = True
-                    break
-
-            if not should_exclude:
-                filtered_docs.append(doc_path)
-
-        return filtered_docs
+        return [
+            doc_path for doc_path in doc_files
+            if doc_path.is_file()
+            and not is_excluded(doc_path.relative_to(root_path), excluded_patterns)
+        ]
 
     async def _process_document(
         self,

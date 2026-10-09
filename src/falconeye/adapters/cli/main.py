@@ -69,7 +69,11 @@ def index(
     exclude: Optional[list[str]] = typer.Option(
         None,
         "--exclude", "-e",
-        help="Exclusion patterns (can specify multiple)",
+        help=(
+            "Extra exclusion pattern, added to file_discovery.default_exclusions "
+            "(repeatable). Wildcards are stripped and the rest must occur in the "
+            "path relative to <path>: '*.stub.ts', '*/generated/*'."
+        ),
     ),
     project_id: Optional[str] = typer.Option(
         None,
@@ -209,18 +213,29 @@ def review(
             "one language in config."
         ),
     ),
+    exclude: Optional[list[str]] = typer.Option(
+        None,
+        "--exclude", "-e",
+        help=(
+            "Extra exclusion pattern for directory reviews, added to "
+            "file_discovery.default_exclusions (repeatable), e.g. -e '*.stub.ts'."
+        ),
+    ),
 ):
     """
     Review a file or directory for security vulnerabilities.
 
     Performs AI-powered security analysis on the specified code.
     The codebase should be indexed first for best results (RAG context).
+    Directory reviews skip files matching file_discovery.default_exclusions
+    (plus any -e patterns), the same list indexing uses.
 
     Usage:
         falconeye review <path>              # Normal mode: Progress bar and results
         falconeye review <path> -v           # Verbose mode: Full logs and LLM streaming
         falconeye review <path> --resume     # Resume interrupted scan without prompting
         falconeye review <path> --concurrency 8   # Analyze 8 files in parallel
+        falconeye review <path> -e "*.stub.ts"    # Skip generated stub files
     """
     review_command(
         path=path,
@@ -238,6 +253,7 @@ def review(
         concurrency=concurrency,
         confirm_taint=confirm_taint,
         console=console,
+        exclude=exclude,
     )
 
 
@@ -309,6 +325,14 @@ def scan(
         help="Max files analyzed in parallel (defaults to config.analysis.batch_size)",
         min=1,
     ),
+    exclude: Optional[list[str]] = typer.Option(
+        None,
+        "--exclude", "-e",
+        help=(
+            "Extra exclusion pattern for both index and review, added to "
+            "file_discovery.default_exclusions (repeatable), e.g. -e '*.stub.ts'."
+        ),
+    ),
 ):
     """
     Index and review in one command.
@@ -350,6 +374,7 @@ def scan(
         resume=resume,
         concurrency=concurrency,
         console=console,
+        exclude=exclude,
     )
 
 
