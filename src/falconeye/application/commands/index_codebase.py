@@ -1,9 +1,9 @@
 """Index codebase command and handler."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import time
 
 from ...domain.models.codebase import Codebase, CodeFile
@@ -19,7 +19,58 @@ from ...domain.repositories.index_registry import IndexRegistryRepository
 from ...domain.value_objects.project_metadata import ProjectMetadata, FileMetadata, FileStatus
 from ...infrastructure.ast.ast_analyzer import EnhancedASTAnalyzer
 from ...infrastructure.logging import FalconEyeLogger
+from ...infrastructure.resilience import CircuitBreakerError
 from ...infrastructure.text import read_source_file
+
+
+#: Default number of chunks per embedding request. Small enough for
+#: local servers that choke on huge batches (a 578-chunk request made
+#: Ollama 0.32 on Windows refuse connections to its own model runner),
+#: large enough to keep round trips few. Overridable via
+#: config.llm.embedding_batch_size.
+DEFAULT_EMBEDDING_BATCH_SIZE = 32
+
+#: Consecutive single-chunk failures that mean "the service is down",
+#: not "these chunks are bad". The file then fails as a whole and is
+#: retried on the next run instead of being stored half-indexed.
+_SERVICE_FAILURE_STREAK = 3
+
+
+class EmbeddingServiceError(RuntimeError):
+    """Embedding failed for service reasons; the file should be retried."""
+
+
+def _is_input_rejection(error: Exception) -> bool:
+    """Whether the endpoint rejected this particular input (HTTP 4xx).
+
+    Backend-agnostic: LiteLLMAdapter raises EmbeddingRequestError (a
+    ValueError) for 4xx, and ollama.ResponseError carries status_code.
+    A rejected chunk is skipped; anything else counts toward the
+    service-failure streak.
+    """
+    if isinstance(error, ValueError):
+        return True
+    status = getattr(error, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500
+
+
+@dataclass
+class IndexRunStats:
+    """What went wrong during one indexing run, for the CLI summary.
+
+    ``files_failed``: (relative path, error) -- nothing stored; the file
+    is not in the registry, so the next run retries it.
+    ``files_partial``: (relative path, chunks skipped, chunks total,
+    first error) -- the embeddable chunks were stored; the file is in
+    the registry, so only --force-reindex (or editing it) retries the
+    skipped chunks.
+    """
+    files_failed: List[Tuple[str, str]] = field(default_factory=list)
+    files_partial: List[Tuple[str, int, int, str]] = field(default_factory=list)
+
+    @property
+    def chunks_skipped(self) -> int:
+        return sum(p[1] for p in self.files_partial)
 
 
 @dataclass
@@ -50,6 +101,11 @@ class IndexCodebaseCommand:
     # not set. This is the same knob that config.analysis.batch_size was
     # supposed to expose but previously didn't wire through.
     concurrency: int = 4
+
+    # Chunks per embedding request. A file's chunks are sent in batches
+    # of this size instead of all at once (a 92k-line generated file is
+    # ~580 chunks). See DEFAULT_EMBEDDING_BATCH_SIZE.
+    embedding_batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
 
 
 class IndexCodebaseHandler:
@@ -101,6 +157,8 @@ class IndexCodebaseHandler:
         self.checksum_service = checksum_service
         self.index_registry = index_registry
         self.logger = FalconEyeLogger.get_instance()
+        # Reset by every handle() call; read by the CLI afterwards.
+        self.last_run_stats = IndexRunStats()
 
     async def handle(self, command: IndexCodebaseCommand) -> Codebase:
         """
@@ -120,6 +178,7 @@ class IndexCodebaseHandler:
         5. Update registry with new metadata
         """
         start_time = time.time()
+        self.last_run_stats = IndexRunStats()
 
         self.logger.info(
             "Starting codebase indexing",
@@ -395,15 +454,34 @@ class IndexCodebaseHandler:
                 }
             )
 
-            # Generate embeddings in batch
+            # Generate embeddings in bounded batches. A chunk the server
+            # rejects is skipped on its own instead of failing the file.
             texts = [chunk.content for chunk in chunks]
-            embeddings = await self.llm_service.generate_embeddings_batch(texts)
-
-            # Add embeddings to chunks
+            vectors, chunk_errors = await self._embed_texts(
+                texts, command.embedding_batch_size, str(relative_path),
+            )
             chunks_with_embeddings = [
-                chunk.with_embedding(embedding)
-                for chunk, embedding in zip(chunks, embeddings)
+                chunk.with_embedding(vector)
+                for chunk, vector in zip(chunks, vectors)
+                if vector is not None
             ]
+            if chunks and not chunks_with_embeddings:
+                raise EmbeddingServiceError(
+                    f"none of {len(chunks)} chunks could be embedded: {chunk_errors[0]}"
+                )
+            if chunk_errors:
+                self.last_run_stats.files_partial.append(
+                    (str(relative_path), len(chunk_errors), len(chunks), chunk_errors[0])
+                )
+                self.logger.warning(
+                    "Some chunks could not be embedded; stored the rest",
+                    extra={
+                        "file_path": str(relative_path),
+                        "chunks_skipped": len(chunk_errors),
+                        "chunks_total": len(chunks),
+                        "first_error": chunk_errors[0],
+                    },
+                )
 
             # Store chunks (project-scoped collection)
             await self.vector_store.store_chunks(chunks_with_embeddings, collection="code")
@@ -434,7 +512,7 @@ class IndexCodebaseHandler:
                 git_commit_hash=file_metadata.git_commit_hash,
                 git_file_hash=file_metadata.git_file_hash,
                 indexed_at=file_metadata.indexed_at,
-                chunk_count=len(chunks),
+                chunk_count=len(chunks_with_embeddings),
                 embedding_ids=embedding_ids,
                 status=FileStatus.ACTIVE,
             )
@@ -459,6 +537,9 @@ class IndexCodebaseHandler:
 
         except Exception as e:
             duration = time.time() - start_time
+            self.last_run_stats.files_failed.append(
+                (str(relative_path), f"{type(e).__name__}: {e}")
+            )
             self.logger.error(
                 "File processing failed",
                 extra={
@@ -469,6 +550,70 @@ class IndexCodebaseHandler:
                 exc_info=True
             )
             return None
+
+    async def _embed_texts(
+        self,
+        texts: List[str],
+        batch_size: int,
+        label: str,
+    ) -> Tuple[List[Optional[List[float]]], List[str]]:
+        """Embed ``texts`` in requests of at most ``batch_size`` texts.
+
+        Returns one vector per text (``None`` where it couldn't be
+        embedded) and an error message per skipped text. A failed batch
+        is retried one text at a time, so a single rejected chunk costs
+        only itself. Raises :class:`EmbeddingServiceError` instead when
+        the failures point at the service rather than the input -- the
+        circuit breaker is open, or several single-text retries in a row
+        fail with non-rejection errors (timeouts, refused connections,
+        5xx). The caller then fails the whole file, which keeps it out
+        of the registry so the next run retries it.
+        """
+        vectors: List[Optional[List[float]]] = [None] * len(texts)
+        errors: List[str] = []
+        size = max(1, batch_size)
+        for start in range(0, len(texts), size):
+            batch = texts[start:start + size]
+            try:
+                out = await self.llm_service.generate_embeddings_batch(batch)
+                if len(out) != len(batch):
+                    raise ValueError(
+                        f"endpoint returned {len(out)} embeddings for {len(batch)} inputs"
+                    )
+                vectors[start:start + len(batch)] = out
+                continue
+            except CircuitBreakerError as e:
+                raise EmbeddingServiceError(str(e)) from e
+            except Exception as e:
+                self.logger.warning(
+                    "Embedding batch failed; retrying its chunks one at a time",
+                    extra={
+                        "file_path": label,
+                        "batch_start": start,
+                        "batch_size": len(batch),
+                        "error": str(e),
+                    },
+                )
+
+            streak = 0
+            for offset, text in enumerate(batch):
+                try:
+                    vectors[start + offset] = (
+                        await self.llm_service.generate_embeddings_batch([text])
+                    )[0]
+                    streak = 0
+                except CircuitBreakerError as e:
+                    raise EmbeddingServiceError(str(e)) from e
+                except Exception as e:
+                    errors.append(f"{type(e).__name__}: {e}")
+                    if _is_input_rejection(e):
+                        continue  # this chunk is bad; keep going
+                    streak += 1
+                    if streak >= _SERVICE_FAILURE_STREAK:
+                        raise EmbeddingServiceError(
+                            f"{streak} consecutive embedding failures: {e}"
+                        ) from e
+        return vectors, errors
 
     async def _filter_changed_files(
         self,
@@ -897,15 +1042,27 @@ class IndexCodebaseHandler:
                 chunk_size=command.doc_chunk_size,
             )
 
-            # Generate embeddings in batch
+            # Generate embeddings in bounded batches (same isolation as
+            # code files: a rejected chunk is skipped on its own).
             texts = [chunk.content for chunk in chunks]
-            embeddings = await self.llm_service.generate_embeddings_batch(texts)
-
-            # Add embeddings to chunks
+            vectors, chunk_errors = await self._embed_texts(
+                texts, command.embedding_batch_size, relative_path,
+            )
             chunks_with_embeddings = [
-                chunk.with_embedding(embedding)
-                for chunk, embedding in zip(chunks, embeddings)
+                chunk.with_embedding(vector)
+                for chunk, vector in zip(chunks, vectors)
+                if vector is not None
             ]
+            if chunk_errors:
+                self.logger.warning(
+                    "Some document chunks could not be embedded; stored the rest",
+                    extra={
+                        "file_path": relative_path,
+                        "chunks_skipped": len(chunk_errors),
+                        "chunks_total": len(chunks),
+                        "first_error": chunk_errors[0],
+                    },
+                )
 
             # Store chunks in separate collection
             await self.vector_store.store_document_chunks(

@@ -286,6 +286,7 @@ def index_command(
         excluded_patterns=exclude,
         project_id=project_id,
         force_reindex=force_reindex,
+        embedding_batch_size=container.config.llm.embedding_batch_size,
         # Concurrency: how many files to embed + store in parallel. Bounded
         # by a semaphore in the handler so the embedding model isn't
         # swamped. Sourced from config.analysis.batch_size (previously the
@@ -419,8 +420,10 @@ def index_command(
     # Display summary
     if not verbose:
         console.print("")  # Add newline after progress bar
-    console.print(f"[green]Indexed {codebase.total_files} files[/green]")
-    
+    stats = getattr(container.index_handler, "last_run_stats", None)
+    failed = len(stats.files_failed) if stats is not None else 0
+    console.print(f"[green]Indexed {codebase.total_files - failed} files[/green]")
+
     # Show all detected languages
     all_langs = codebase.all_languages
     if len(all_langs) == 1:
@@ -428,8 +431,41 @@ def index_command(
     else:
         langs_str = ", ".join(all_langs)
         console.print(f"[green]Languages: {langs_str}[/green]")
-    
+
     console.print(f"[green]Total lines: {codebase.total_lines}[/green]")
+    if stats is not None:
+        _print_index_problems(console, stats)
+
+
+def _print_index_problems(console: Console, stats) -> None:
+    """Warn about files missing from the RAG index, in whole or in part.
+
+    These files are still reviewed (review reads them from disk); what's
+    lost is their use as related-code context for other files. Paths and
+    errors are printed as Text: both are arbitrary strings.
+    """
+    shown = 5
+    if stats.files_partial:
+        console.print(Text(
+            f"{len(stats.files_partial)} file(s) indexed partially: "
+            f"{stats.chunks_skipped} chunk(s) could not be embedded and are "
+            "missing from RAG context. Fix the cause, then re-run with "
+            "--force-reindex to retry them.",
+            style="yellow",
+        ))
+        for path, skipped, total, error in stats.files_partial[:shown]:
+            console.print(Text(f"  - {path}: {skipped}/{total} chunks skipped ({error})", style="dim"))
+    if stats.files_failed:
+        console.print(Text(
+            f"{len(stats.files_failed)} file(s) could not be indexed; they get "
+            "no RAG context and are retried on the next run:",
+            style="yellow",
+        ))
+        for path, error in stats.files_failed[:shown]:
+            console.print(Text(f"  - {path}: {error}", style="dim"))
+    hidden = max(0, len(stats.files_partial) - shown) + max(0, len(stats.files_failed) - shown)
+    if hidden:
+        console.print(Text(f"  ... and {hidden} more", style="dim"))
 
 
 def review_command(

@@ -50,6 +50,53 @@ from ..resilience import (
 )
 
 
+class EmbeddingRequestError(ValueError):
+    """The embedding endpoint rejected a request with a 4xx status.
+
+    Carries the server's own error text, which ``raise_for_status``
+    drops. A ValueError subclass on purpose: the circuit breaker
+    excludes ValueError, so one bad batch can't trip the breaker for
+    an endpoint that is up, and the retry policy (which retries
+    connection-level errors only) doesn't resend a rejected request.
+    """
+
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"embedding request rejected (HTTP {status_code}): {body}")
+
+
+def _error_detail(response: httpx.Response, limit: int = 500) -> str:
+    """The server's error text, trimmed; empty if the body is unreadable."""
+    try:
+        return response.text.strip()[:limit]
+    except Exception:
+        return ""
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """``response.raise_for_status()``, but keep the server's error text.
+
+    httpx's message carries only the status line, so an Ollama/vLLM
+    explanation like "input length exceeds the context length" was lost
+    from logs. Same exception type, so retry/breaker policy is unchanged.
+    Streaming responses must be read (``await response.aread()``) first.
+    """
+    if response.status_code < 400:
+        return
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        detail = _error_detail(response)
+        if not detail:
+            raise
+        raise httpx.HTTPStatusError(
+            f"{e} -- server said: {detail}",
+            request=e.request,
+            response=e.response,
+        ) from None
+
+
 class LiteLLMAdapter(LLMService):
     """
     LiteLLM (OpenAI-compatible) LLM adapter.
@@ -144,6 +191,14 @@ class LiteLLMAdapter(LLMService):
         )
         self.circuit_breaker = CircuitBreaker(
             name="litellm_llm",
+            config=cb_config,
+        )
+        # Embeddings get their own breaker. They often run on a different
+        # host (e.g. a local Ollama) than chat, and trouble there during
+        # indexing must not block the analysis calls that follow it in
+        # `falconeye scan`.
+        self.embedding_circuit_breaker = CircuitBreaker(
+            name="litellm_embeddings",
             config=cb_config,
         )
 
@@ -326,7 +381,7 @@ class LiteLLMAdapter(LLMService):
                     },
                 }
             r = await self._chat_client.post("/chat/completions", json=payload)
-            r.raise_for_status()
+            _raise_for_status(r)
             data = r.json()
             return data["choices"][0]["message"]["content"] or ""
 
@@ -478,7 +533,7 @@ class LiteLLMAdapter(LLMService):
             }
             payload = self._apply_response_format(payload)
             r = await self._chat_client.post("/chat/completions", json=payload)
-            r.raise_for_status()
+            _raise_for_status(r)
             data = r.json()
             return data["choices"][0]["message"]["content"] or ""
 
@@ -514,7 +569,9 @@ class LiteLLMAdapter(LLMService):
             async with self._chat_client.stream(
                 "POST", "/chat/completions", json=payload
             ) as r:
-                r.raise_for_status()
+                if r.status_code >= 400:
+                    await r.aread()  # so the error text can be reported
+                _raise_for_status(r)
                 async for raw_line in r.aiter_lines():
                     if not raw_line:
                         continue
@@ -548,14 +605,22 @@ class LiteLLMAdapter(LLMService):
         return await _do()
 
     async def _embeddings(self, inputs: List[str]) -> List[List[float]]:
-        """Batched embedding request. Retry + circuit breaker wrapped."""
+        """Batched embedding request. Retry + circuit breaker wrapped.
 
-        @self.circuit_breaker.protect
+        A 4xx raises :class:`EmbeddingRequestError` with the server's
+        message (not retried, not counted by the breaker); 5xx and
+        connection errors behave as before. Uses the embedding-only
+        breaker, so indexing trouble can't block chat calls.
+        """
+
+        @self.embedding_circuit_breaker.protect
         @retry_with_backoff(self.retry_config)
         async def _do():
             payload = {"model": self.embedding_model, "input": inputs}
             r = await self._embedding_client.post("/embeddings", json=payload)
-            r.raise_for_status()
+            if 400 <= r.status_code < 500:
+                raise EmbeddingRequestError(r.status_code, _error_detail(r))
+            _raise_for_status(r)
             data = r.json()
             # OpenAI returns results in a possibly-permuted order but with
             # an explicit "index" field. Sort defensively.

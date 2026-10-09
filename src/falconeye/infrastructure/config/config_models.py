@@ -183,6 +183,16 @@ class LLMConfig(BaseModel):
         default_factory=CircuitBreakerConfigModel,
         description="Circuit breaker configuration"
     )
+    embedding_batch_size: int = Field(
+        default=32,
+        ge=1,
+        le=512,
+        description=(
+            "Max chunks per embedding request during indexing (all providers). "
+            "A file's chunks are sent in batches of this size; a failed batch is "
+            "retried chunk by chunk so only rejected chunks are skipped."
+        ),
+    )
 
     @field_validator('provider')
     @classmethod

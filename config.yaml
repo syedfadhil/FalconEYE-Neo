@@ -34,6 +34,7 @@ llm:
   base_url: http://localhost:11434  # Base URL for LLM API (Ollama only; LiteLLM uses llm.litellm.*_base_url)
   timeout: 120  # Request timeout in seconds
   max_retries: 3  # [DEPRECATED] Use retry.max_retries instead
+  embedding_batch_size: 32  # Max chunks per embedding request while indexing (all providers)
 
   # Retry Logic with Exponential Backoff
   retry:
