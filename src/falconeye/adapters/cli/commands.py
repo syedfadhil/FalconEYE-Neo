@@ -1238,7 +1238,11 @@ def review_command(
             console.print("[bold cyan]Final Summary[/bold cyan]")
             console.print("[bold cyan]" + "=" * 70 + "[/bold cyan]")
         console.print("")
-        console.print(output)
+        # Verbatim: the report carries LLM-written text and code
+        # snippets. console.print would parse them as Rich markup
+        # (``args[name]`` vanishes, ``a[/b]`` raises MarkupError) and
+        # re-wrap JSON/SARIF lines.
+        console.out(output, highlight=False)
 
 
 def scan_command(
@@ -1565,10 +1569,12 @@ def _run_taint_confirmation(
             languages=taint_languages,
         )
     except Exception as e:
-        console.print(
-            f"[yellow]Taint confirmation failed ({type(e).__name__}: {e}). "
-            "Continuing without confirmation enrichment.[/yellow]"
-        )
+        # Text, not markup: the exception message is arbitrary.
+        console.print(Text(
+            f"Taint confirmation failed ({type(e).__name__}: {e}). "
+            "Continuing without confirmation enrichment.",
+            style="yellow",
+        ))
         return
 
     # Replace findings in place. SecurityReview.findings is a list;

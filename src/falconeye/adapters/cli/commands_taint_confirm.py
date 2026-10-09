@@ -28,6 +28,7 @@ from uuid import UUID
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from ...domain.models.confirmation import (
     CONFIRMATION_STATUS_NO_ENCLOSING_METHOD,
@@ -83,7 +84,9 @@ def taint_confirm_command(
     try:
         findings = _load_findings(findings_file)
     except (OSError, json.JSONDecodeError, ValueError) as e:
-        console.print(f"[red]Could not load findings from {findings_file}:[/red] {e}")
+        console.print(Text.assemble(
+            (f"Could not load findings from {findings_file}:", "red"), f" {e}",
+        ))
         sys.exit(2)
 
     if not findings:
@@ -355,20 +358,26 @@ def _print_console(
     Compact one-line-per-finding format:
         [status] file:line -- issue (severity)
         -> chain: A -> B -> C   (only for reachable)
+
+    Built from Text, never markup: the issue is LLM-written, the path
+    and chain come from the analyzed code, and the ``[status]`` label
+    itself is lowercase -- as markup Rich read it as an unknown style
+    tag and silently dropped it from every line.
     """
     for f in findings:
         conf = f.taint_confirmation
         status = conf.status if conf else "no_confirmation"
         color = _status_color(status)
-        console.print(
-            f"[{color}][{status}][/{color}] "
-            f"{f.file_path}:{f.line_start or '?'} -- "
-            f"{f.issue} [dim]({f.severity.value})[/dim]"
-        )
+        console.print(Text.assemble(
+            (f"[{status}]", color), " ",
+            f"{f.file_path}:{f.line_start or '?'} -- {f.issue} ",
+            (f"({f.severity.value})", "dim"),
+        ))
         if conf and conf.is_reachable and conf.shortest_chain:
-            arrow = " [dim]->[/dim] "
-            chain = arrow.join(conf.shortest_chain)
-            console.print(f"    [dim]chain:[/dim] {chain}")
+            chain = Text(" -> ", style="dim").join(
+                Text(node) for node in conf.shortest_chain
+            )
+            console.print(Text.assemble("    ", ("chain:", "dim"), " ", chain))
 
 
 def _status_color(status: str) -> str:
@@ -391,7 +400,9 @@ def _write_json(
     payload = [f.to_dict() for f in findings]
     text = json.dumps(payload, indent=2, default=str)
     if output_file is None:
-        console.print(text)
+        # Verbatim: console.print would re-wrap long lines (invalid
+        # JSON when piped) and parse LLM text as markup.
+        console.out(text, highlight=False)
     else:
         output_file.write_text(text, encoding="utf-8")
         console.print(f"[green]Wrote {len(findings)} findings to[/green] {output_file}")

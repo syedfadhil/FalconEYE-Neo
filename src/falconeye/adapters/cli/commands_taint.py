@@ -128,9 +128,10 @@ def taint_command(
         console.print(f"Results written to [cyan]{output_file}[/cyan]")
     else:
         # For console formatter, route through the rich console so ANSI
-        # colours render. Other formatters (json/sarif/html) are raw text.
+        # colours render -- via console.out, so LLM-written text isn't
+        # parsed as markup. Other formatters (json/sarif/html) are raw text.
         if fmt_name == "console":
-            console.print(rendered)
+            console.out(rendered, highlight=False)
         else:
             sys.stdout.write(rendered)
             sys.stdout.write("\n")

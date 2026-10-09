@@ -17,6 +17,7 @@ from typing import Optional
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from ...infrastructure.di.container import DIContainer
 
@@ -105,10 +106,12 @@ def skill_list_command(
             if s.is_runnable_today
             else "[yellow]deferred[/yellow]"
         )
+        # Text cells: frontmatter values are operator-authored and must
+        # not be parsed as Rich markup.
         table.add_row(
-            s.name,
-            s.metadata.category or "-",
-            s.metadata.function or "scan",
+            Text(s.name),
+            Text(s.metadata.category or "-"),
+            Text(s.metadata.function or "scan"),
             str(len(s.discovery_patterns)),
             runnable_marker,
         )
@@ -135,13 +138,17 @@ def _print_pattern_details(skills, console: Console) -> None:
     (from the # comment above the grep), file extensions, and a
     truncated regex. Full regexes are often long enough to wrap
     unhelpfully in a terminal.
+
+    Descriptions and regexes are printed as Text, never as markup: a
+    regex is exactly the kind of string Rich mangles (``\\[`` loses
+    its backslash, a ``[/]`` class raises MarkupError).
     """
     for s in skills:
-        console.print(
-            f"\n[bold]{s.name}[/bold] "
-            f"[dim]({len(s.discovery_patterns)} pattern"
-            f"{'s' if len(s.discovery_patterns) != 1 else ''})[/dim]"
-        )
+        n = len(s.discovery_patterns)
+        console.print(Text.assemble(
+            "\n", (s.name, "bold"), " ",
+            (f"({n} pattern{'s' if n != 1 else ''})", "dim"),
+        ))
         if not s.discovery_patterns:
             console.print("  [dim](no discovery patterns; LLM-only skill)[/dim]")
             continue
@@ -149,9 +156,9 @@ def _print_pattern_details(skills, console: Console) -> None:
             desc = p.description or "(no description)"
             ext_str = ",".join(p.extensions)
             regex_display = p.regex if len(p.regex) <= 80 else p.regex[:77] + "..."
-            console.print(f"  [{i}] {desc}")
-            console.print(f"      [dim]ext:[/dim] {ext_str}")
-            console.print(f"      [dim]regex:[/dim] {regex_display}")
+            console.print(Text(f"  [{i}] {desc}"))
+            console.print(Text.assemble("      ", ("ext:", "dim"), " ", ext_str))
+            console.print(Text.assemble("      ", ("regex:", "dim"), " ", regex_display))
 
 
 
@@ -214,8 +221,8 @@ def skill_run_command(
     matches = [s for s in all_skills if s.name == skill_name]
     if not matches:
         available = ", ".join(sorted(s.name for s in all_skills)) or "(none)"
-        console.print(f"[red]Skill '{skill_name}' not found.[/red]")
-        console.print(f"[dim]Available skills:[/dim] {available}")
+        console.print(Text(f"Skill '{skill_name}' not found.", style="red"))
+        console.print(Text.assemble(("Available skills:", "dim"), " ", available))
         _sys.exit(2)
     skill = matches[0]
 
@@ -277,7 +284,7 @@ def skill_run_command(
     except ValueError as e:
         # Runner rejects unrunnable skills with ValueError -- we
         # pre-checked above but the runner is defensive too.
-        console.print(f"[red]{e}[/red]")
+        console.print(Text(str(e), style="red"))
         _sys.exit(2)
 
     # -- Summary line --
@@ -348,7 +355,7 @@ def _print_run_summary(console: Console, summary) -> None:
         console.print("[yellow]Files with errors:[/yellow]")
         for o in summary.outcomes:
             if o.error:
-                console.print(f"  {o.file_path}: [red]{o.error}[/red]")
+                console.print(Text.assemble(f"  {o.file_path}: ", (o.error, "red")))
     console.print()
 
 
@@ -362,7 +369,10 @@ def _print_findings_console(console: Console, review) -> None:
     """
     from ..formatters.console_formatter import ConsoleFormatter
     formatter = ConsoleFormatter(use_color=True, verbose=False)
-    console.print(formatter.format_review(review))
+    # Verbatim: the report carries LLM-written text and code snippets,
+    # which Rich's markup parser would mangle (``args[name]`` reads as
+    # a style tag and vanishes) or crash on (``a[/b]``).
+    console.out(formatter.format_review(review), highlight=False)
 
 
 def _write_findings_json(review, output_file, console: Console) -> None:
@@ -380,7 +390,9 @@ def _write_findings_json(review, output_file, console: Console) -> None:
     }
     text = _json.dumps(payload, indent=2, default=str)
     if output_file is None:
-        console.print(text)
+        # Verbatim: console.print would re-wrap long lines (invalid
+        # JSON when piped) and parse LLM text as markup.
+        console.out(text, highlight=False)
     else:
         output_file.write_text(text, encoding="utf-8")
         console.print(
@@ -519,31 +531,29 @@ def _print_batch_summary(console: Console, batch, *, dedupe: bool) -> None:
 
     console.print(f"\n[bold]Batch summary[/bold]")
     for o in batch.outcomes:
+        # Names come from skill frontmatter and reasons can carry
+        # exception text, so both are Text, never markup.
+        name = (o.skill_name, "bold")
         if o.status == BATCH_STATUS_RAN and o.summary is not None:
             n = o.summary.total_findings
             errs = o.summary.files_with_llm_errors
-            err_str = f"  [red]{errs} error{'s' if errs != 1 else ''}[/red]" if errs else ""
-            console.print(
-                f"  [green]RAN[/green]      "
-                f"[bold]{o.skill_name}[/bold]: "
-                f"{n} finding{'s' if n != 1 else ''}"
-                f"{err_str}"
-            )
+            err_str = (f"  {errs} error{'s' if errs != 1 else ''}", "red") if errs else ""
+            console.print(Text.assemble(
+                "  ", ("RAN", "green"), "      ", name, ": ",
+                f"{n} finding{'s' if n != 1 else ''}", err_str,
+            ))
         elif o.status == BATCH_STATUS_SKIPPED_NOT_SCAN:
-            console.print(
-                f"  [yellow]SKIPPED[/yellow]  "
-                f"[bold]{o.skill_name}[/bold]: [dim]{o.reason}[/dim]"
-            )
+            console.print(Text.assemble(
+                "  ", ("SKIPPED", "yellow"), "  ", name, ": ", (o.reason, "dim"),
+            ))
         elif o.status == BATCH_STATUS_SKIPPED_NO_PATTERNS:
-            console.print(
-                f"  [yellow]SKIPPED[/yellow]  "
-                f"[bold]{o.skill_name}[/bold]: [dim]{o.reason}[/dim]"
-            )
+            console.print(Text.assemble(
+                "  ", ("SKIPPED", "yellow"), "  ", name, ": ", (o.reason, "dim"),
+            ))
         elif o.status == BATCH_STATUS_ERROR:
-            console.print(
-                f"  [red]ERROR[/red]    "
-                f"[bold]{o.skill_name}[/bold]: {o.reason}"
-            )
+            console.print(Text.assemble(
+                "  ", ("ERROR", "red"), "    ", name, ": ", o.reason,
+            ))
 
     # Totals line
     totals_parts = [
