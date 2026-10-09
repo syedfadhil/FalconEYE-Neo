@@ -164,6 +164,7 @@ def skill_run_command(
     config_path: Optional[Path],
     skills_dir_override: Optional[Path],
     console: Console,
+    confirm_taint: bool = False,
 ) -> None:
     """Execute a single skill against a workspace.
 
@@ -175,6 +176,10 @@ def skill_run_command(
     Same output modes as ``skill list`` -- console table or JSON. When
     ``--output-file`` is set, JSON is written to disk; otherwise
     console output goes to stdout.
+
+    With ``confirm_taint``, findings are enriched with call-graph
+    reachability before output -- the same enrichment ``falconeye
+    review --confirm-taint`` performs.
     """
     import asyncio
     import json as _json
@@ -278,11 +283,56 @@ def skill_run_command(
     # -- Summary line --
     _print_run_summary(console, summary)
 
+    _confirm_findings(
+        confirm_taint=confirm_taint,
+        container=container,
+        review=review,
+        workspace=workspace,
+        console=console,
+    )
+
     # -- Output --
     if output_format == "json":
         _write_findings_json(review, output_file, console)
     else:
         _print_findings_console(console, review)
+
+
+def _confirm_findings(
+    *,
+    confirm_taint: bool,
+    container,
+    review,
+    workspace: Path,
+    console: Console,
+) -> None:
+    """Apply ``--confirm-taint`` reachability enrichment to skill findings.
+
+    Mirrors ``review_command``'s handling and delegates to the same
+    ``_run_taint_confirmation`` helper, so both entry points share one
+    implementation of the language gating, the non-fatal failure
+    handling, and the one-line diagnostic. Confirmation is additive:
+    findings are never dropped, whatever their reachability status.
+    """
+    if not confirm_taint or not review.findings:
+        return
+    confirmation_service = getattr(container, "review_confirmation_service", None)
+    if confirmation_service is None:
+        console.print(
+            "[yellow]--confirm-taint requested but no taint-enabled "
+            "language is configured. Skipping confirmation.[/yellow]"
+        )
+        return
+    # Imported lazily: commands.py pulls in the whole review pipeline,
+    # and this module stays import-light.
+    from .commands import _run_taint_confirmation
+    _run_taint_confirmation(
+        review=review,
+        repo_path=workspace if workspace.is_dir() else workspace.parent,
+        confirmation_service=confirmation_service,
+        config=container.config,
+        console=console,
+    )
 
 
 def _print_run_summary(console: Console, summary) -> None:
@@ -348,6 +398,7 @@ def skill_run_all_command(
     skills_dir_override: Optional[Path],
     dedupe: bool,
     console: Console,
+    confirm_taint: bool = False,
 ) -> None:
     """Execute every runnable skill against a workspace.
 
@@ -361,6 +412,9 @@ def skill_run_all_command(
     Skipped skills are surfaced in the summary with the reason so the
     operator can see why (and fix the skill file if the skip was
     unintentional).
+
+    With ``confirm_taint``, reachability enrichment runs after dedup,
+    so each merged finding is confirmed once.
     """
     import asyncio
     import json as _json
@@ -433,6 +487,14 @@ def skill_run_all_command(
 
     # Per-skill summary table
     _print_batch_summary(console, batch, dedupe=dedupe)
+
+    _confirm_findings(
+        confirm_taint=confirm_taint,
+        container=container,
+        review=review,
+        workspace=workspace,
+        console=console,
+    )
 
     # Findings output
     if output_format == "json":

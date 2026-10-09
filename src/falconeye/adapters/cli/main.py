@@ -719,10 +719,10 @@ def projects_cleanup(
 app.add_typer(projects_app, name="projects")
 
 
-# Create skill subcommand group -- audit-playbook skills, Phase 1a.
+# Create skill subcommand group -- audit-playbook skills.
 skill_app = typer.Typer(
     name="skill",
-    help="Load and inspect security audit skills (Phase 1a: list only; run lands in Phase 1b)",
+    help="List and run security audit skills (operator-authored audit playbooks)",
     no_args_is_help=True,
 )
 
@@ -802,6 +802,15 @@ def skill_run(
         help="Path to config file",
         exists=True,
     ),
+    confirm_taint: bool = typer.Option(
+        False,
+        "--confirm-taint",
+        help=(
+            "Run call-graph reachability confirmation on the skill's findings "
+            "before output (same enrichment as `review --confirm-taint`). "
+            "Requires taint to be enabled for at least one language in config."
+        ),
+    ),
 ):
     """
     Execute a skill against a workspace.
@@ -821,6 +830,7 @@ def skill_run(
         falconeye skill run injection-prevention Portal
         falconeye skill run injection-prevention Portal --output json --output-file inj.json
         falconeye skill run injection-prevention Portal --skills-dir ~/skills
+        falconeye skill run injection-prevention Portal --confirm-taint
     """
     skill_run_command(
         skill_name=skill_name,
@@ -830,6 +840,7 @@ def skill_run(
         config_path=config,
         skills_dir_override=skills_dir,
         console=console,
+        confirm_taint=confirm_taint,
     )
 
 
@@ -871,6 +882,15 @@ def skill_run_all(
         help="Path to config file",
         exists=True,
     ),
+    confirm_taint: bool = typer.Option(
+        False,
+        "--confirm-taint",
+        help=(
+            "Run call-graph reachability confirmation on the aggregated findings "
+            "(after dedup) before output. Requires taint to be enabled for at "
+            "least one language in config."
+        ),
+    ),
 ):
     """
     Execute every runnable skill against a workspace.
@@ -891,6 +911,7 @@ def skill_run_all(
         falconeye skill run-all Portal
         falconeye skill run-all Portal --output json --output-file all.json
         falconeye skill run-all Portal --no-dedupe
+        falconeye skill run-all Portal --confirm-taint -o json --output-file all.json
     """
     skill_run_all_command(
         workspace=workspace,
@@ -900,6 +921,7 @@ def skill_run_all(
         skills_dir_override=skills_dir,
         dedupe=dedupe,
         console=console,
+        confirm_taint=confirm_taint,
     )
 
 
