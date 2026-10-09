@@ -23,8 +23,11 @@ FalconEYE represents a paradigm shift in static code analysis. Instead of relyin
 - [How It Works](#how-it-works)
 - [Getting Started](#getting-started)
 - [MLX Backend (Apple Silicon)](#mlx-backend-apple-silicon)
+- [LiteLLM Backend (OpenAI-compatible)](#litellm-backend-openai-compatible)
 - [Supported Languages](#supported-languages)
 - [CLI Reference](#cli-reference)
+- [Taint Analysis & Reachability Confirmation](#taint-analysis--reachability-confirmation)
+- [Audit Skills](#audit-skills)
 - [Output Formats](#output-formats)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
@@ -46,7 +49,9 @@ Traditional security scanners are limited by their pattern databases. They can o
 - **Reduced False Positives** — Optional AI validation pass filters noise from false alarms
 - **Rich Reporting** — Console, JSON, HTML, and SARIF output with interactive dashboards
 - **Smart Re-indexing** — Incremental analysis means re-scans only process changed files
-- **Privacy-First** — Runs entirely locally with Ollama or MLX — your code never leaves your machine
+- **Reachability Confirmation** — Optional call-graph pass marks which findings are reachable from HTTP entry points (C# / ASP.NET Core today)
+- **Audit Skills** — Run your own markdown audit playbooks (grep-guided or whole-file) against a codebase
+- **Privacy-First** — Runs entirely locally with Ollama or MLX — your code never leaves your machine. With the LiteLLM backend, code goes to the endpoint you configure (e.g. an on-prem vLLM server).
 - **Apple Silicon Accelerated** — Native MLX backend delivers 20-40% faster inference on M-series chips
 
 ---
@@ -165,11 +170,16 @@ falconeye review /path/to/your/project    # Analyze for vulnerabilities
 falconeye scan /path/to/your/project --backend mlx
 
 # Generate an HTML report
-falconeye scan /path/to/your/project --format html --output report.html
+falconeye scan /path/to/your/project -o html --output-file report.html
+
+# Skip generated or vendored files in both steps
+falconeye scan /path/to/your/project -e "*.stub.ts" -e "*/generated/*"
 
 # Verbose mode -- see LLM streaming and full logs
 falconeye scan /path/to/your/project -v
 ```
+
+> **Run from one directory.** The index, log file and reports live under the directory you run `falconeye` from (`./falconeye_data/`, `./falconeye.log`, `./falconeye_reports/`). Run `index`, `review` and `scan` from the same place, or set absolute paths in `~/.falconeye/config.yaml` -- otherwise `review` finds no index and analyzes without RAG context. See [Data & Log Locations](#data--log-locations).
 
 ---
 
@@ -247,6 +257,32 @@ The `info` command shows whether your system supports MLX, including Apple Silic
 
 ---
 
+## LiteLLM Backend (OpenAI-compatible)
+
+`provider: litellm` talks the OpenAI protocol, so FalconEYE can use a LiteLLM proxy, vLLM, SGLang, TGI or any other OpenAI-compatible server. Chat (analysis) and embeddings can live on different hosts -- a common setup is a shared GPU server for analysis and a local Ollama for embeddings:
+
+```yaml
+llm:
+  provider: litellm
+  litellm:
+    chat_base_url: https://llm.internal.example:8443/v1
+    chat_model: gemma-4-31b-it-heretic
+    chat_api_key: ""                         # LiteLLM virtual key; empty for unauthenticated
+    embedding_base_url: http://localhost:11434/v1   # Ollama's OpenAI-compatible endpoint
+    embedding_model: embeddinggemma:300m
+    max_tokens: 32768
+    request_timeout: 600.0
+    guided_json: true                        # enforce the finding schema (vLLM >= 0.6, SGLang)
+  embedding_batch_size: 32                   # max chunks per embedding request (all providers)
+```
+
+- `guided_json` sends `response_format.json_schema` so the server constrains output to FalconEYE's finding schema. Set it to `false` for servers that don't support it.
+- The `--backend` flag only switches between `ollama` and `mlx`; choose LiteLLM with `llm.provider`.
+- With LiteLLM, your code is sent to `chat_base_url` and `embedding_base_url`. Point them at infrastructure you trust.
+- Indexing sends each file's chunks in batches of `embedding_batch_size`. If the server rejects a batch, its chunks are retried one at a time and only the rejected ones are skipped; the index summary lists any partially indexed files. (Very large batches made Ollama on Windows refuse connections to its own model runner, reported as HTTP 400.)
+
+---
+
 ## Supported Languages
 
 FalconEYE analyzes code in 11 languages with language-specific security knowledge:
@@ -277,9 +313,16 @@ Each language has a dedicated plugin with tailored security prompts, vulnerabili
 | `falconeye scan <path>` | Index and review in one step |
 | `falconeye index <path>` | Index codebase for analysis |
 | `falconeye review <path>` | Analyze code for vulnerabilities |
+| `falconeye taint <path>` | Spec-driven source-to-sink taint scan (see [Taint Analysis](#taint-analysis--reachability-confirmation)) |
+| `falconeye taint-confirm <path> -f findings.json` | Add call-graph reachability to saved findings |
+| `falconeye skill list` | List audit skills (`--show-patterns` to see Step 1 patterns) |
+| `falconeye skill lint` | Check skill files for problems without running them |
+| `falconeye skill run <name> <path>` | Run one audit skill (see [Audit Skills](#audit-skills)) |
+| `falconeye skill run-all <path>` | Run every runnable skill and merge the findings |
+| `falconeye feedback <finding-id>` | Record true/false-positive feedback (SAGE memory) |
 | `falconeye upgrade` | Pull latest changes and reinstall dependencies |
 | `falconeye info` | System and configuration information |
-| `falconeye config --init` | Create default configuration file |
+| `falconeye config --init` / `--show` | Create / print the configuration |
 | `falconeye projects list` | Show all indexed projects |
 | `falconeye projects info <id>` | Display project details |
 | `falconeye projects delete <id>` | Delete a project and its data |
@@ -287,19 +330,25 @@ Each language has a dedicated plugin with tailored security prompts, vulnerabili
 
 ### Common Flags
 
-| Flag | Short | Description |
-|------|-------|-------------|
-| `--backend` | `-b` | LLM backend: `ollama` (default) or `mlx` |
-| `--verbose` | `-v` | Detailed output with LLM streaming and full logs |
-| `--language` | `-l` | Programming language (auto-detected if omitted) |
-| `--config` | `-c` | Path to configuration file |
-| `--format` | `-o` | Output format: `console`, `json`, `html`, `sarif` |
-| `--output-file` | | Save results to a specific file |
-| `--validate` | | Enable AI validation pass to reduce false positives |
-| `--top-k` | | Number of similar code chunks for RAG context (default: 5) |
-| `--severity` | | Minimum severity to report: `critical`, `high`, `medium`, `low` |
-| `--force-reindex` | | Force re-index all files (ignore cache) |
-| `--exclude` | `-e` | Glob patterns to exclude (repeatable) |
+| Flag | Short | Commands | Description |
+|------|-------|----------|-------------|
+| `--backend` | `-b` | index, review, scan | LLM backend: `ollama` (default) or `mlx` |
+| `--verbose` | `-v` | index, review, scan | Logs and LLM streaming on the console (logs always go to the log file) |
+| `--language` | `-l` | index, review, scan | Programming language (auto-detected if omitted) |
+| `--config` | `-c` | all | Path to configuration file |
+| `--output` | `-o` | review, scan, taint, skill | Output format: `console`, `json`, `html`, `sarif` (`skill` and `taint-confirm`: `console` or `json`) |
+| `--output-file` | | review, scan, taint, skill | Save results to a specific file |
+| `--validate` | | review, scan | Enable AI validation pass to reduce false positives |
+| `--top-k` | | review | Number of similar code chunks for RAG context (default: 5) |
+| `--severity` | | review | Minimum severity to report: `critical`, `high`, `medium`, `low` |
+| `--exclude` | `-e` | index, review, scan | Extra exclusion pattern, added to `file_discovery.default_exclusions` (repeatable) |
+| `--force-reindex` | | index, scan | Force re-index all files (ignore cache) |
+| `--concurrency` | | review, scan | Max files analyzed in parallel (default: `analysis.batch_size`) |
+| `--resume` / `--no-resume` | | review, scan | Resume an interrupted scan from its checkpoint, or start fresh |
+| `--confirm-taint` | | review, skill run, skill run-all | Add call-graph reachability to each finding |
+| `--sage` | | review, scan | Use SAGE persistent memory for historical context |
+
+**Exclusion patterns** strip their wildcards and match the remainder anywhere in the path relative to `<path>`: `*/node_modules/*` skips any `node_modules` directory, `*.stub.ts` skips files containing `.stub.ts`. Either `/` or `\` works. The same list applies to indexing and review.
 
 ### Examples
 
@@ -308,7 +357,7 @@ Each language has a dedicated plugin with tailored security prompts, vulnerabili
 falconeye scan ./src --backend mlx
 
 # Review with AI validation and HTML output
-falconeye review ./src --validate --format html --output report.html
+falconeye review ./src --validate -o html --output-file report.html
 
 # Scan with verbose output (see LLM reasoning in real-time)
 falconeye scan ./src -v
@@ -317,20 +366,108 @@ falconeye scan ./src -v
 falconeye review ./src --severity high
 
 # SARIF output for CI/CD integration
-falconeye review ./src --format sarif --output results.sarif
+falconeye review ./src -o sarif --output-file results.sarif
 
 # Force re-index and scan
 falconeye scan ./src --force-reindex
 
-# Exclude test directories
-falconeye scan ./src --exclude "tests/*" --exclude "vendor/*"
+# Exclude test and vendored directories (added to the configured defaults)
+falconeye scan ./src -e "*/tests/*" -e "*/vendor/*"
+
+# Review and confirm which findings are reachable from HTTP endpoints
+falconeye review ./src --confirm-taint
 ```
 
 ### Verbose Mode
 
-**Normal mode** (default): Clean progress bar with file count and percentage. Findings are displayed after LLM enrichment completes with full details.
+**Normal mode** (default): Clean progress bar with file count and percentage. Findings are displayed after LLM enrichment completes with full details. Logs go only to the log file (`logging.file`). After indexing, a summary lists any files that could not be indexed, or were indexed only partially.
 
-**Verbose mode** (`-v`): Full indexing logs, LLM thought process streaming, detailed progress information, and complete error stack traces.
+**Verbose mode** (`-v`): Full indexing logs, LLM thought process streaming, detailed progress information, and complete error stack traces on the console, in addition to the log file.
+
+---
+
+## Taint Analysis & Reachability Confirmation
+
+Taint support is opt-in per language and currently covers **C#** (ASP.NET Core). Enable it in your config; `csharp` must also be listed in `languages.enabled`:
+
+```yaml
+languages:
+  per_language:
+    csharp:
+      taint:
+        enabled: true
+        max_hops: 5                 # call-graph edges from source to sink (1-20)
+        specs: []                   # empty = auto-detect frameworks from .csproj files
+        framework_autodetect: true
+```
+
+**Reachability confirmation** is the main use. It builds a call graph of the workspace, detects HTTP entry points (controller actions with `[HttpGet]`, `[HttpPost]`, `[Route]` and similar attributes), and marks each finding with a `taint_confirmation`: `confirmed_reachable` (with the call chain), `not_confirmed`, `no_enclosing_method`, `no_entry_points` or `skipped`. Confirmation only adds signal: findings that aren't confirmed keep their severity and confidence and are never dropped.
+
+```bash
+falconeye review ./Portal --confirm-taint                 # review + confirmation in one run
+falconeye skill run-all ./Portal --confirm-taint          # same for skill findings
+falconeye taint-confirm ./Portal -f findings.json -o json --output-file confirmed.json
+```
+
+`taint-confirm` accepts the JSON written by `review -o json` or by `skill run -o json`.
+
+**Spec-driven scan.** `falconeye taint <path>` searches for source-to-sink paths using the shipped spec (`taint_specs/csharp_generic.yaml`: ADO.NET commands, `Process.Start`, file I/O, XML parsers, unsafe deserializers, outbound HTTP, reflection) and has the LLM verify each candidate path (`--no-verify` shows the raw candidates; `--max-hops` overrides the config).
+
+**Limits.**
+- Minimal-API endpoints (`app.MapGet(...)`), SignalR hubs and gRPC services are not detected as entry points yet.
+- Calls across namespaces are only partly resolved, so reachable code can come back `not_confirmed`.
+
+---
+
+## Audit Skills
+
+Skills are your own audit playbooks in markdown. FalconEYE runs them against a codebase and reports the results as ordinary findings.
+
+**Where skills live.** Skills are read from `skills.directory` (default `~/.falconeye/skills`), as `<dir>/<name>/SKILL.md` or `<dir>/<name>.md`; entries starting with `_` are skipped. Enable them with `skills.enabled: true`, or set `FALCONEYE_SKILLS_DIR` (still requires `skills.enabled`). `--skills-dir` on the command line overrides both and works even when skills are disabled.
+
+**File format.** YAML frontmatter, then the audit procedure that is sent to the LLM. Grep commands in a fenced `bash` block under a `Step 1` heading become discovery patterns:
+
+````markdown
+---
+name: injection-prevention
+description: SQL and command injection audit
+function: scan              # scan runs; verify / triage are listed but not run yet
+category: web-api-security
+---
+
+## Step 1 -- Discover
+
+```bash
+# EF Core raw SQL
+grep -rn -E "(FromSqlRaw|ExecuteSqlRaw)\(" --include="*.cs" .
+```
+
+## Step 2 -- Evaluate
+...
+````
+
+Patterns use Python regex semantics; `--include` filters by extension and is required.
+
+**How skills run.**
+- **With discovery patterns:** the grep hits pick the files, and the LLM evaluates each file once, with its hits listed. Hits are capped at 40 per pattern and 200 in total, shared fairly across patterns.
+- **Without patterns** ("locate and read" skills): the skill runs as a sweep, with one LLM call per source file of the enabled languages, up to `--max-files` (default `skills.max_llm_only_files`, 50). A FalconEYE-specific `targets:` frontmatter list of filename globs replaces the default selection, for example `targets: [package.json, "*.csproj", "requirements*.txt"]` for a dependency audit.
+- **`run-all`** runs every scan skill. LLM-only skills are included only with `--include-llm-only`. Findings at the same (file, line, category) are merged by default (`--no-dedupe` to keep them all), and the survivor keeps the `skill:<name>` tags of every skill that flagged it.
+
+```bash
+falconeye skill list --show-patterns
+falconeye skill lint                                     # find dead patterns and parsing problems
+falconeye skill run injection-prevention ./Portal -o json --output-file inj.json
+falconeye skill run input-validation ./Portal/src/Api --max-files 20
+falconeye skill run-all ./Portal --include-llm-only --max-files 25
+```
+
+**`skill lint`** reports what would otherwise fail silently:
+- regexes Python can't compile, or reads differently from `grep -E` (BRE-style `\|`, `[[:alpha:]]`, `\<`);
+- grep commands the loader ignores (no `-E`, combined `-rnE`, no `--include`);
+- broken frontmatter, which would turn a `verify` skill into a runnable `scan` skill;
+- duplicate names, and skills that can't run yet.
+
+It exits 1 on errors.
 
 ---
 
@@ -372,18 +509,20 @@ FalconEYE uses a hierarchical configuration system. Files are loaded in order (l
 
 1. Default config: `<install-dir>/config.yaml`
 2. User config: `~/.falconeye/config.yaml`
-3. Project config: `./falconeye.yaml`
+3. Project config: `./falconeye.yaml` or `./.falconeye.yaml` (in the directory you run from)
+4. `--config <file>` on the command line, then environment overrides such as `FALCONEYE_LLM_BASE_URL` and `FALCONEYE_OUTPUT_COLOR`
 
 Create `~/.falconeye/config.yaml` to customize:
 
 ```yaml
 llm:
-  provider: ollama                  # LLM provider: "ollama" or "mlx"
+  provider: ollama                  # "ollama", "mlx" or "litellm" (see LiteLLM Backend)
   model:
     analysis: qwen3-coder:30b      # AI model for security analysis
     embedding: embeddinggemma:300m  # Model for code embeddings
   base_url: http://localhost:11434
   timeout: 600                      # Request timeout in seconds
+  embedding_batch_size: 32          # Max chunks per embedding request while indexing
   mlx:
     analysis: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit  # MLX model
 
@@ -392,6 +531,17 @@ analysis:
   validate_findings: true    # Enable AI validation pass
   batch_size: 10            # Files per batch
 
+file_discovery:
+  default_exclusions:       # used by index AND review; -e adds to this list
+    - "*/node_modules/*"
+    - "*/dist/*"
+    - "*.min.js"
+
+skills:
+  enabled: true
+  directory: ~/.falconeye/skills
+  max_llm_only_files: 50    # file cap for sweeping skills without Step 1 patterns
+
 output:
   default_format: json      # console, json, html, sarif
   color: true               # Color-coded console output
@@ -399,13 +549,24 @@ output:
 
 logging:
   level: INFO               # DEBUG, INFO, WARNING, ERROR, CRITICAL
-  file: ./falconeye.log
-  console: true
+  file: ./falconeye.log     # always written; console output appears with -v
   rotation: daily
   retention_days: 30
 ```
 
-See the [default config.yaml](config.yaml) for all available options.
+See the [default config.yaml](config.yaml) for all available options, including taint settings (`languages.per_language`).
+
+### Data & Log Locations
+
+These default paths are **relative to the directory you run `falconeye` from**:
+
+| What | Default path |
+|------|--------------|
+| Vector index, metadata, index registry | `./falconeye_data/` |
+| Log file (JSON lines) | `./falconeye.log` |
+| Reports | `./falconeye_reports/` |
+
+Running `index` in one directory and `review` in another means `review` sees no index, so it analyzes without cross-file context. Run the commands from one place, or set absolute `persist_directory`, `logging.file` and `output.output_directory` paths in `~/.falconeye/config.yaml`.
 
 ---
 
@@ -422,25 +583,29 @@ FalconEYE follows hexagonal (ports and adapters) architecture for clean separati
 ┌──────────────────────────▼───────────────────────────────────┐
 │                    APPLICATION LAYER                          │
 │  IndexCodebaseCommand  |  ReviewFileCommand                  │
+│  TaintScan  |  ReviewConfirmation  |  SkillRunner            │
 └──────────────────────────┬───────────────────────────────────┘
                            │
 ┌──────────────────────────▼───────────────────────────────────┐
 │                      DOMAIN LAYER                            │
 │  SecurityAnalyzer  |  ContextAssembler  |  Models  |  Ports  │
+│  CallGraph  |  EntryPointDetector  |  TaintVerifier          │
 └──────────────────────────┬───────────────────────────────────┘
                            │
 ┌──────────────────────────▼───────────────────────────────────┐
 │                   INFRASTRUCTURE LAYER                        │
 │  Ollama Adapter  |  MLX Adapter  |  ChromaDB  |  Plugins     │
+│  LiteLLM Adapter  |  C# Taint Adapter  |  Skill Loader       │
 │  Config Loader   |  DI Container |  Language Detection       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
 - Domain layer defines abstract ports (`LLMService`, `VectorStore`); infrastructure provides concrete adapters
-- DI container wires everything together with a factory pattern (`backend_override` selects MLX or Ollama)
+- DI container wires everything together with a factory pattern (`llm.provider` selects Ollama, MLX or LiteLLM; `--backend` can switch to MLX)
 - Language plugins are self-contained: each provides security prompts, vulnerability categories, framework context, and chunking strategies
-- Circuit breaker and retry patterns protect against LLM failures
+- Circuit breaker and retry patterns protect against LLM failures; embeddings and chat have separate breakers, so indexing trouble can't block analysis
+- Optional stages (reachability confirmation, skills) only add to the findings: a failure in them is reported and never stops the primary output
 - Structured JSON logging with correlation IDs
 
 ---
@@ -466,13 +631,19 @@ pytest tests/integration/ -v
 ## FAQ
 
 **Q: Does my code get sent to external services?**
-A: No. FalconEYE runs entirely locally using Ollama or MLX. Your code never leaves your machine.
+A: Not with Ollama or MLX: FalconEYE runs entirely locally and your code never leaves your machine. With `provider: litellm`, code is sent to the `chat_base_url` / `embedding_base_url` you configure, so point them at infrastructure you trust (for example an on-prem vLLM server).
 
 **Q: How accurate is AI-based analysis compared to traditional scanners?**
 A: FalconEYE complements traditional tools. It excels at finding context-dependent vulnerabilities and novel patterns that signature-based tools miss. The LLM enrichment pass ensures every finding includes specific details, and the optional AI validation pass reduces false positives.
 
 **Q: Can I use different AI models?**
-A: Yes. Configure any Ollama-compatible model in your config file. On Apple Silicon, you can also use any MLX-compatible model from HuggingFace's `mlx-community` namespace by setting `--backend mlx`.
+A: Yes. Configure any Ollama-compatible model in your config file. On Apple Silicon, you can also use any MLX-compatible model from HuggingFace's `mlx-community` namespace by setting `--backend mlx`. Any OpenAI-compatible server (LiteLLM, vLLM, SGLang, TGI) works through `provider: litellm`.
+
+**Q: The index summary says some files "could not be indexed" or were "indexed partially". Does that affect the review?**
+A: Those files are still reviewed, because review reads files from disk. They are missing, in whole or in part, from the RAG index, so they won't be offered as related code when other files are analyzed. The summary shows the server's error for each one, and `falconeye.log` has the details. Files that failed completely are retried on the next run; to retry skipped chunks, re-run with `--force-reindex`.
+
+**Q: How do I keep generated or vendored code out of a scan?**
+A: Add patterns to `file_discovery.default_exclusions` (for example `"*.stub.ts"`, `"*/generated/*"`), or pass `-e` to `index`, `review` or `scan`. Exclusions apply to indexing and review alike.
 
 **Q: What is the MLX backend and why should I use it?**
 A: MLX is Apple's ML framework for Apple Silicon. It provides 20-40% faster inference, ~30% lower memory usage, and ~50% lower first-token latency compared to Ollama by leveraging unified memory and running inference directly on the GPU/Neural Engine without HTTP overhead. Use `--backend mlx` or set `provider: mlx` in your config.
@@ -484,7 +655,7 @@ A: Local models (especially smaller quantized ones) sometimes produce findings w
 A: Run `falconeye upgrade` from anywhere. It detects your git clone location, runs `git pull origin main`, and reinstalls any new or updated dependencies automatically. If you're already on the latest version it will tell you so without making any changes.
 
 **Q: How do I integrate this into CI/CD?**
-A: Use SARIF output format (`--format sarif`) which integrates with GitHub Security, GitLab, and most DevSecOps platforms.
+A: Use SARIF output (`-o sarif --output-file results.sarif`), which integrates with GitHub Security, GitLab, and most DevSecOps platforms.
 
 **Q: How long does analysis take?**
 A: Initial indexing depends on codebase size. Subsequent scans with smart re-indexing only process changed files. Using the MLX backend on Apple Silicon reduces analysis time by 20-40% compared to Ollama.
@@ -541,10 +712,20 @@ falconeye scan /path/to/project --backend mlx
 falconeye review /path/to/project
 
 # Generate HTML report
-falconeye review /path/to/project --format html --output report.html
+falconeye review /path/to/project -o html --output-file report.html
 
 # Filter by severity
 falconeye review /path/to/project --severity high
+
+# Skip generated files (added to the configured exclusions)
+falconeye scan /path/to/project -e "*.stub.ts"
+
+# Confirm which findings are reachable from HTTP entry points (C#)
+falconeye review /path/to/project --confirm-taint
+
+# Audit skills
+falconeye skill lint
+falconeye skill run-all /path/to/project --include-llm-only
 
 # Verbose mode with LLM streaming
 falconeye scan /path/to/project -v
@@ -560,14 +741,19 @@ falconeye projects list
 ```
 
 ### Default Output Locations
+Relative to the directory you run `falconeye` from (see [Data & Log Locations](#data--log-locations)):
+- **Index**: `./falconeye_data/`
 - **Reports**: `./falconeye_reports/`
 - **Logs**: `./falconeye.log`
+
+User-level:
 - **Config**: `~/.falconeye/config.yaml`
+- **Skills**: `~/.falconeye/skills/`
 
 ---
 
 **Built for security engineers who demand more than pattern matching.**
 
-Version 2.0.0 | Python 3.12+ | Ollama + MLX
+Version 2.1.0 | Python 3.12+ | Ollama + MLX + LiteLLM
 
 By [hardw00t](https://github.com/hardw00t) & [h4ckologic](https://github.com/h4ckologic)
