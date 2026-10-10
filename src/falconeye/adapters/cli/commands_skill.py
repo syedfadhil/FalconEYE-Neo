@@ -375,6 +375,7 @@ def skill_run_command(
         review, summary = asyncio.run(runner.run(
             skill=skill,
             workspace=workspace,
+            max_total_hits=_discovery_hit_cap(container),
             sweep_extensions=sweep_exts,
             max_sweep_files=sweep_cap,
         ))
@@ -437,6 +438,18 @@ def _confirm_findings(
         config=container.config,
         console=console,
     )
+
+
+def _discovery_hit_cap(container) -> int:
+    """config.skills.max_discovery_hits, or the runner's default (200).
+
+    The setting existed (and config.yaml documented it) but nothing
+    read it: every run used GrepRunner.DEFAULT_MAX_TOTAL_HITS.
+    """
+    from ...infrastructure.skills.grep_runner import GrepRunner
+
+    skills = getattr(getattr(container, "config", None), "skills", None)
+    return getattr(skills, "max_discovery_hits", None) or GrepRunner.DEFAULT_MAX_TOTAL_HITS
 
 
 def _sweep_settings(container, max_files: Optional[int]):
@@ -646,6 +659,7 @@ def skill_run_all_command(
         include_llm_only=include_llm_only,
         sweep_extensions=sweep_exts,
         max_sweep_files=sweep_cap,
+        max_total_hits=_discovery_hit_cap(container),
     ))
 
     # Per-skill summary table

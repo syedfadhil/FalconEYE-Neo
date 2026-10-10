@@ -394,11 +394,13 @@ class LanguageTaintConfig(BaseModel):
     without further tuning:
       - ``max_hops`` bounds the path finder; 5 is generous for
         most codebases and cheap for the LLM verifier
-      - ``specs`` empty means "auto-detect frameworks from the
-        scanned repo"; a non-empty list pins the spec set
-        (useful for reproducible CI runs)
-      - ``framework_autodetect`` gates the .csproj / requirements
-        scan; set false when ``specs`` is pinned
+      - ``specs`` and ``framework_autodetect`` are accepted but NOT
+        USED YET. The container loads every built-in spec for the
+        language (only csharp_generic ships) when it starts, before
+        the workspace is known, so nothing calls the adapter's
+        detect_frameworks() or passes load_taint_index's
+        framework_hints. They are kept so existing configs still
+        validate (extra="forbid").
     """
     enabled: bool = Field(
         default=False,
@@ -412,11 +414,11 @@ class LanguageTaintConfig(BaseModel):
     )
     specs: List[str] = Field(
         default_factory=list,
-        description="Explicit spec-file names (empty means auto-detect)",
+        description="Explicit spec-file names. Not used yet: all built-in specs load.",
     )
     framework_autodetect: bool = Field(
         default=True,
-        description="Detect frameworks via project files (.csproj, requirements.txt, ...)",
+        description="Detect frameworks via project files. Not used yet.",
     )
 
     model_config = ConfigDict(extra="forbid")

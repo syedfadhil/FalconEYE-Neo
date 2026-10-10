@@ -132,6 +132,10 @@ class IndexCodebaseCommand:
     # model's context. See DEFAULT_MAX_CHUNK_CHARS.
     max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS
 
+    # Ceiling (lines) for adaptive chunk sizes on large files
+    # (chunking.max_chunk_size).
+    max_chunk_size: int = 200
+
 
 class IndexCodebaseHandler:
     """
@@ -469,6 +473,7 @@ class IndexCodebaseHandler:
                 chunk_size=command.chunk_size,
                 overlap=command.chunk_overlap,
                 max_chars=command.max_chunk_chars,
+                max_lines=command.max_chunk_size,
             )
 
             self.logger.debug(
@@ -816,6 +821,7 @@ class IndexCodebaseHandler:
         chunk_size: int,
         overlap: int,
         max_chars: Optional[int] = None,
+        max_lines: Optional[int] = None,
     ) -> List[CodeChunk]:
         """
         Chunk file content with adaptive sizing for large files.
@@ -841,6 +847,8 @@ class IndexCodebaseHandler:
             chunk_size: Lines per chunk
             overlap: Overlap lines
             max_chars: Character cap per chunk (None = lines only)
+            max_lines: Ceiling for adaptive chunk sizes
+                (chunking.max_chunk_size; None = 200)
 
         Returns:
             List of code chunks
@@ -850,15 +858,15 @@ class IndexCodebaseHandler:
 
         # Adaptive chunking for large files.
         # For files above ADAPTIVE_THRESHOLD_LINES, scale chunk size up (capped at
-        # MAX_ADAPTIVE_CHUNK_SIZE, which mirrors chunking.max_chunk_size in
-        # config.yaml) so the number of chunks — and therefore the number of LLM
+        # MAX_ADAPTIVE_CHUNK_SIZE, i.e. chunking.max_chunk_size when the caller
+        # passes it) so the number of chunks — and therefore the number of LLM
         # calls — grows sub-linearly with file size.
         #
         # Target: ~50 chunks for moderately large files (up to ~10k lines). For
         # very large files (>10k lines) the chunk size is capped, so chunk count
         # continues to grow but at a much slower rate than with the default size.
         ADAPTIVE_THRESHOLD_LINES = 1000
-        MAX_ADAPTIVE_CHUNK_SIZE = 200
+        MAX_ADAPTIVE_CHUNK_SIZE = max_lines or 200
         TARGET_CHUNK_COUNT = 50
 
         if total_lines > ADAPTIVE_THRESHOLD_LINES:

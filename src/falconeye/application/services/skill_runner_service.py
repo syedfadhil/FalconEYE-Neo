@@ -585,6 +585,7 @@ class SkillRunnerService:
         include_llm_only: bool = False,
         sweep_extensions: Optional[Iterable[str]] = None,
         max_sweep_files: int = DEFAULT_MAX_SWEEP_FILES,
+        max_total_hits: int = GrepRunner.DEFAULT_MAX_TOTAL_HITS,
     ) -> "tuple[SecurityReview, SkillBatchSummary]":
         """Run every runnable skill in ``skills`` against ``workspace``.
 
@@ -647,6 +648,7 @@ class SkillRunnerService:
             try:
                 sub_review, sub_summary = await self.run(
                     skill=skill, workspace=workspace,
+                    max_total_hits=max_total_hits,
                     sweep_extensions=sweep_extensions if sweep else None,
                     max_sweep_files=max_sweep_files,
                 )

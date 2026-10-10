@@ -405,8 +405,6 @@ languages:
       taint:
         enabled: true
         max_hops: 5                 # call-graph edges from source to sink (1-20)
-        specs: []                   # empty = auto-detect frameworks from .csproj files
-        framework_autodetect: true
 ```
 
 **Reachability confirmation** is the main use. It builds a call graph of the workspace, detects HTTP entry points (controller actions with `[HttpGet]`, `[HttpPost]`, `[Route]` and similar attributes), and marks each finding with a `taint_confirmation`: `confirmed_reachable` (with the call chain), `not_confirmed`, `no_enclosing_method`, `no_entry_points` or `skipped`. Confirmation only adds signal: findings that aren't confirmed keep their severity and confidence and are never dropped.
@@ -457,7 +455,7 @@ grep -rn -E "(FromSqlRaw|ExecuteSqlRaw)\(" --include="*.cs" .
 Patterns use Python regex semantics; `--include` filters by extension and is required.
 
 **How skills run.**
-- **With discovery patterns:** the grep hits pick the files, and the LLM evaluates each file once, with its hits listed. Hits are capped at 40 per pattern and 200 in total, shared fairly across patterns.
+- **With discovery patterns:** the grep hits pick the files, and the LLM evaluates each file once, with its hits listed. Hits are capped at 40 per pattern and `skills.max_discovery_hits` (200) in total, shared fairly across patterns.
 - **Without patterns** ("locate and read" skills): the skill runs as a sweep, with one LLM call per source file of the enabled languages, up to `--max-files` (default `skills.max_llm_only_files`, 50). A FalconEYE-specific `targets:` frontmatter list of filename globs replaces the default selection, for example `targets: [package.json, "*.csproj", "requirements*.txt"]` for a dependency audit.
 - **`run-all`** runs every scan skill. LLM-only skills are included only with `--include-llm-only`. Findings at the same (file, line, category) are merged by default (`--no-dedupe` to keep them all), and the survivor keeps the `skill:<name>` tags of every skill that flagged it.
 
