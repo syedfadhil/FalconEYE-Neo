@@ -43,6 +43,7 @@ from ...domain.models.security import (
     Severity,
 )
 from ...infrastructure.di.container import DIContainer
+from .logging_setup import configure_cli_logging
 
 
 def taint_confirm_command(
@@ -54,6 +55,7 @@ def taint_confirm_command(
     languages: Optional[List[str]],
     config_path: Optional[Path],
     console: Console,
+    verbose: bool = False,
 ) -> None:
     """Entry point for ``falconeye taint-confirm``.
 
@@ -70,6 +72,7 @@ def taint_confirm_command(
     container = DIContainer.create(
         config_path=str(config_path) if config_path else None,
     )
+    configure_cli_logging(getattr(container, "config", None), verbose)
     service = container.review_confirmation_service
     if service is None:
         console.print(

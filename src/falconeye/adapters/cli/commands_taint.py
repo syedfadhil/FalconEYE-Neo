@@ -17,6 +17,7 @@ from rich.console import Console
 
 from ..formatters.formatter_factory import FormatterFactory
 from ...infrastructure.di.container import DIContainer
+from .logging_setup import configure_cli_logging
 
 
 def taint_command(
@@ -28,6 +29,7 @@ def taint_command(
     verify: bool,
     config_path: Optional[Path],
     console: Console,
+    verbose: bool = False,
 ) -> None:
     """Scan a codebase for taint-based vulnerabilities.
 
@@ -43,6 +45,7 @@ def taint_command(
     container = DIContainer.create(
         config_path=str(config_path) if config_path else None,
     )
+    configure_cli_logging(getattr(container, "config", None), verbose)
     if container.taint_scan_service is None:
         console.print(
             "[red]Taint analysis is not enabled in the config.[/red]"

@@ -341,7 +341,7 @@ Each language has a dedicated plugin with tailored security prompts, vulnerabili
 | Flag | Short | Commands | Description |
 |------|-------|----------|-------------|
 | `--backend` | `-b` | index, review, scan | LLM backend: `ollama` (default) or `mlx` |
-| `--verbose` | `-v` | index, review, scan | Logs and LLM streaming on the console (logs always go to the log file) |
+| `--verbose` | `-v` | index, review, scan, taint, taint-confirm, skill run, skill run-all | Logs (and, for review, LLM streaming) on the console; logs always go to the log file |
 | `--language` | `-l` | index, review, scan | Programming language (auto-detected if omitted) |
 | `--config` | `-c` | all | Path to configuration file |
 | `--output` | `-o` | review, scan, taint, skill | Output format: `console`, `json`, `html`, `sarif` (`skill` and `taint-confirm`: `console` or `json`) |

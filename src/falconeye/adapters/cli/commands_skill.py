@@ -17,6 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from ...infrastructure.di.container import DIContainer
+from .logging_setup import configure_cli_logging
 
 
 def _resolve_skill_loader(
@@ -265,6 +266,7 @@ def skill_run_command(
     console: Console,
     confirm_taint: bool = False,
     max_files: Optional[int] = None,
+    verbose: bool = False,
 ) -> None:
     """Execute a single skill against a workspace.
 
@@ -331,6 +333,7 @@ def skill_run_command(
     container = DIContainer.create(
         config_path=str(config_path) if config_path else None,
     )
+    configure_cli_logging(getattr(container, "config", None), verbose)
     llm_service = getattr(container, "llm_service", None)
     if llm_service is None:
         console.print(
@@ -566,6 +569,7 @@ def skill_run_all_command(
     confirm_taint: bool = False,
     include_llm_only: bool = False,
     max_files: Optional[int] = None,
+    verbose: bool = False,
 ) -> None:
     """Execute every runnable skill against a workspace.
 
@@ -618,6 +622,7 @@ def skill_run_all_command(
     container = DIContainer.create(
         config_path=str(config_path) if config_path else None,
     )
+    configure_cli_logging(getattr(container, "config", None), verbose)
     llm_service = getattr(container, "llm_service", None)
     if llm_service is None:
         console.print(

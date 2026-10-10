@@ -186,17 +186,9 @@ def _configure_logger_verbosity(container, verbose: bool) -> None:
         container: DI container with config
         verbose: Whether verbose mode is enabled
     """
-    cfg = container.config.logging
-    # configure(), not get_instance(...): the singleton already exists
-    # by now (the LLM adapters create it during DIContainer.create),
-    # and get_instance ignores arguments after the first call.
-    FalconEyeLogger.get_instance().configure(
-        level=cfg.level,
-        log_file=Path(cfg.file) if cfg.file else None,
-        console=verbose,
-        rotation=cfg.rotation,
-        retention_days=cfg.retention_days,
-    )
+    from .logging_setup import configure_cli_logging
+
+    configure_cli_logging(container.config, verbose)
 
 
 def _estimate_time_based_progress(elapsed_seconds: float) -> int:

@@ -535,6 +535,11 @@ def taint(
         help="Path to config file",
         exists=True,
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Show logs on the console (they always go to the log file)",
+    ),
 ):
     """
     Scan a codebase for taint-based vulnerabilities.
@@ -565,6 +570,7 @@ def taint(
         verify=verify,
         config_path=config,
         console=console,
+        verbose=verbose,
     )
 
 
@@ -602,6 +608,11 @@ def taint_confirm(
         help="Path to config file",
         exists=True,
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Show logs on the console (they always go to the log file)",
+    ),
 ):
     """
     Confirm review findings by call-graph reachability analysis.
@@ -630,6 +641,7 @@ def taint_confirm(
         languages=languages,
         config_path=config,
         console=console,
+        verbose=verbose,
     )
 
 
@@ -881,6 +893,11 @@ def skill_run(
             "files (one LLM call each). Default: config.skills.max_llm_only_files (50)."
         ),
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Show logs on the console (they always go to the log file)",
+    ),
 ):
     """
     Execute a skill against a workspace.
@@ -917,6 +934,7 @@ def skill_run(
         console=console,
         confirm_taint=confirm_taint,
         max_files=max_files,
+        verbose=verbose,
     )
 
 
@@ -984,6 +1002,11 @@ def skill_run_all(
             "Default: config.skills.max_llm_only_files (50)."
         ),
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Show logs on the console (they always go to the log file)",
+    ),
 ):
     """
     Execute every runnable skill against a workspace.
@@ -1019,6 +1042,7 @@ def skill_run_all(
         confirm_taint=confirm_taint,
         include_llm_only=include_llm_only,
         max_files=max_files,
+        verbose=verbose,
     )
 
 
