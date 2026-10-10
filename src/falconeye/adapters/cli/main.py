@@ -6,6 +6,7 @@ from typing import List, Optional
 import typer
 from rich.console import Console
 
+from ... import __version__
 from .banner import print_banner
 from .commands import (
     index_command,
@@ -34,7 +35,7 @@ from .commands_projects import (
 # Create Typer app
 app = typer.Typer(
     name="falconeye",
-    help="FalconEYE v2.0 - AI-Powered Security Code Review",
+    help=f"FalconEYE v{__version__} - AI-Powered Security Code Review",
     add_completion=False,
     no_args_is_help=True,
     rich_markup_mode="rich",

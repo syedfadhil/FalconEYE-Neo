@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import yaml
 
+from ... import __version__
 from .config_models import FalconEyeConfig
 
 
@@ -218,7 +219,7 @@ class ConfigLoader:
         yaml_content = default_config.to_yaml()
 
         # Add comments to YAML
-        yaml_with_comments = f"""# FalconEYE v2.0 Configuration
+        yaml_with_comments = f"""# FalconEYE v{__version__} Configuration
 #
 # This file configures FalconEYE's behavior. You can override these settings
 # with environment variables (FALCONEYE_*) or by specifying --config at runtime.

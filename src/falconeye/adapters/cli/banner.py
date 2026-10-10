@@ -4,6 +4,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
+from ... import __version__
+
 
 def print_banner(console: Console):
     """Print FalconEYE ASCII art banner."""
@@ -20,7 +22,7 @@ def print_banner(console: Console):
     # Create styled text
     banner_text = Text(banner, style="bold cyan")
     subtitle = Text("Security Code Review", style="bold bright_cyan", justify="center")
-    version = Text("v2.0 - AI-Powered Analysis", style="dim cyan", justify="center")
+    version = Text(f"v{__version__} - AI-Powered Analysis", style="dim cyan", justify="center")
     authors = Text("by hardw00t & h4ckologic", style="italic dim cyan", justify="center")
     
     # Print banner
@@ -45,9 +47,9 @@ def print_compact_banner(console: Console):
     ║  ██╔══╝  ██╔══██║██║     ██║     ██║   ██║██║╚██╗██║██╔══╝    ╚██╔╝  ██╔══╝    ║
     ║  ██║     ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║███████╗   ██║   ███████╗  ║
     ║  ╚═╝     ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚══════╝  ║
-    ║                      Security Code Review - v2.0                          ║
+    ║{title}║
     ╚═══════════════════════════════════════════════════════════════════════════╗
-    """
-    
+    """.replace("{title}", f"Security Code Review - v{__version__}".center(75))
+
     console.print(banner, style="cyan")
     console.print()

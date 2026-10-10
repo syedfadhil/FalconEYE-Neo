@@ -1,7 +1,7 @@
 [project]
 name = "falconeye"
 version = "2.1.0"
-description = "FalconEYE v2.0 - AI-powered security code review with hexagonal architecture"
+description = "FalconEYE - AI-powered security code review with hexagonal architecture"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
 keywords = ["security", "llm", "code-review", "ollama"]

@@ -14,6 +14,7 @@ from rich.text import Text
 from rich.table import Table
 from rich import box
 
+from ... import __version__
 from ...infrastructure.di.container import DIContainer
 from ...infrastructure.config.config_loader import ConfigLoader
 from ...infrastructure.presentation.error_presenter import ErrorPresenter
@@ -1457,7 +1458,7 @@ def info_command(config_path: Optional[str], console: Console):
 
         # Version info
         console.print("\n[bold]Version:[/bold]")
-        console.print("  FalconEYE: 2.0.0")
+        console.print(f"  FalconEYE: {__version__}")
         console.print("  Analysis: AI-powered (ZERO pattern matching)")
 
         # LLM info
