@@ -31,6 +31,13 @@ from ...infrastructure.workspace_files import is_excluded
 #: config.llm.embedding_batch_size.
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
 
+#: Default character cap per code chunk. Sized for embeddinggemma's
+#: 2,048-token context: measured on a real TS monorepo, source code
+#: runs 2.5-4.2 chars/token (median 3.6) and generated data 2.0-5.0
+#: (median 3.1), so 4,500 chars stays within the window for all source
+#: samples and nearly all data. Overridable via chunking.max_chunk_chars.
+DEFAULT_MAX_CHUNK_CHARS = 4500
+
 #: Consecutive single-chunk failures that mean "the service is down",
 #: not "these chunks are bad". The file then fails as a whole and is
 #: retried on the next run instead of being stored half-indexed.
@@ -39,6 +46,19 @@ _SERVICE_FAILURE_STREAK = 3
 
 class EmbeddingServiceError(RuntimeError):
     """Embedding failed for service reasons; the file should be retried."""
+
+
+def _char_capped_end(lines: List[str], start: int, end: int, max_chars: int) -> int:
+    """Last line index (exclusive) in [start, end) that keeps the chunk
+    within ``max_chars``. Always includes at least one line, so a single
+    over-long line (minified code) becomes its own chunk rather than
+    being split mid-line."""
+    total = 0
+    for i in range(start, end):
+        total += len(lines[i])
+        if total > max_chars:
+            return max(i, start + 1)
+    return end
 
 
 def _is_input_rejection(error: Exception) -> bool:
@@ -107,6 +127,10 @@ class IndexCodebaseCommand:
     # of this size instead of all at once (a 92k-line generated file is
     # ~580 chunks). See DEFAULT_EMBEDDING_BATCH_SIZE.
     embedding_batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
+
+    # Character cap per code chunk, so each chunk fits the embedding
+    # model's context. See DEFAULT_MAX_CHUNK_CHARS.
+    max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS
 
 
 class IndexCodebaseHandler:
@@ -444,6 +468,7 @@ class IndexCodebaseHandler:
                 language=language,
                 chunk_size=command.chunk_size,
                 overlap=command.chunk_overlap,
+                max_chars=command.max_chunk_chars,
             )
 
             self.logger.debug(
@@ -790,6 +815,7 @@ class IndexCodebaseHandler:
         language: str,
         chunk_size: int,
         overlap: int,
+        max_chars: Optional[int] = None,
     ) -> List[CodeChunk]:
         """
         Chunk file content with adaptive sizing for large files.
@@ -797,12 +823,24 @@ class IndexCodebaseHandler:
         Chunks at line boundaries, NOT arbitrary character counts.
         For large files (>1000 lines), uses larger chunks to reduce overhead.
 
+        ``max_chars`` additionally ends a chunk before it would exceed
+        that many characters (still at a line boundary; a single longer
+        line stays one chunk). It exists because the embedding model
+        only sees its context window: 200-line adaptive chunks ran to
+        ~9,000 chars, were cut to 8,000 by the adapter and again to
+        2,048 tokens by the server, so most of each chunk never reached
+        the index. A chunk cut short this way overlaps the next by at
+        most 20% of its own lines (the ratio adaptive chunking uses), so
+        the walk always advances. Chunks under the cap are exactly as
+        before.
+
         Args:
             content: File content
             file_path: File path
             language: Language
             chunk_size: Lines per chunk
             overlap: Overlap lines
+            max_chars: Character cap per chunk (None = lines only)
 
         Returns:
             List of code chunks
@@ -849,9 +887,18 @@ class IndexCodebaseHandler:
         chunks = []
         start = 0
         chunk_index = 0
+        char_limited = 0
 
         while start < len(lines):
             end = min(start + chunk_size, len(lines))
+            advance = chunk_size - overlap
+            if max_chars:
+                capped_end = _char_capped_end(lines, start, end, max_chars)
+                if capped_end < end:
+                    end = capped_end
+                    taken = end - start
+                    advance = taken - min(overlap, taken // 5)
+                    char_limited += 1
 
             # Get chunk content
             chunk_lines = lines[start:end]
@@ -878,7 +925,7 @@ class IndexCodebaseHandler:
             chunk_index += 1
 
             # Move to next chunk with overlap
-            start += (chunk_size - overlap)
+            start += advance
 
         # Update total chunks
         chunks = [
@@ -904,6 +951,7 @@ class IndexCodebaseHandler:
                 "total_lines": total_lines,
                 "chunk_count": len(chunks),
                 "avg_chunk_size": total_lines // len(chunks) if chunks else 0,
+                "char_limited_chunks": char_limited,
             }
         )
 

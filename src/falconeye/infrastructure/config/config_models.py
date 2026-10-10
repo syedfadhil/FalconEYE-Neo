@@ -268,6 +268,17 @@ class ChunkingConfig(BaseModel):
         le=1000,
         description="Maximum lines per chunk"
     )
+    max_chunk_chars: int = Field(
+        default=4500,
+        ge=500,
+        le=100000,
+        description=(
+            "Maximum characters per code chunk (chunks still break at line "
+            "boundaries). Keep each chunk inside the embedding model's context: "
+            "code runs ~2.5-4 chars/token, so 4500 suits a 2048-token model such "
+            "as embeddinggemma. Raise it for larger-context embedding models."
+        ),
+    )
 
     @field_validator('default_overlap')
     @classmethod

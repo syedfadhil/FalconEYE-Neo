@@ -286,6 +286,7 @@ def index_command(
         project_id=project_id,
         force_reindex=force_reindex,
         embedding_batch_size=container.config.llm.embedding_batch_size,
+        max_chunk_chars=container.config.chunking.max_chunk_chars,
         # Concurrency: how many files to embed + store in parallel. Bounded
         # by a semaphore in the handler so the embedding model isn't
         # swamped. Sourced from config.analysis.batch_size (previously the

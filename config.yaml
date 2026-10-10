@@ -72,6 +72,10 @@ chunking:
   default_size: 50  # Default lines per chunk
   default_overlap: 10  # Default lines of overlap
   max_chunk_size: 200  # Maximum lines per chunk
+  max_chunk_chars: 4500  # Maximum characters per chunk -- keep within the embedding
+                         # model's context (~2.5-4 chars/token for code; 4500 suits
+                         # embeddinggemma's 2048 tokens). Re-index with --force-reindex
+                         # after changing it.
   # Note: For files > 1000 lines, adaptive chunking automatically increases
   # chunk size (capped at max_chunk_size) and scales overlap proportionally.
   # The target is ~50 chunks for moderately large files; files significantly

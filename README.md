@@ -11,7 +11,15 @@
 
 **Next-Generation Security Code Analysis Powered by Local LLMs**
 
-*by hardw00t & h4ckologic*
+*FalconEYE-Neo – maintained by [syedfadhil](https://github.com/syedfadhil) · based on FalconEYE by [hardw00t](https://github.com/hardw00t) & [h4ckologic](https://github.com/h4ckologic)*
+
+> [!NOTE]
+> **About this project**
+>
+> - FalconEYE-Neo is an independent continuation of **FalconEYE**, originally developed by hardw00t & h4ckologic and published at
+> `github.com/FalconEYE-ai/FalconEYE`. That repository is no longer publicly available (as of September 2026).
+> - This project is **not affiliated with or endorsed by** the original authors. Please report issues with FalconEYE-Neo here, not to them.
+> - Licensed under **AGPL-3.0-or-later**, like the original – see [License](#license).
 
 FalconEYE represents a paradigm shift in static code analysis. Instead of relying on predefined vulnerability patterns, it leverages large language models to reason about your code the same way a security expert would — understanding context, intent, and subtle security implications that traditional tools miss.
 
